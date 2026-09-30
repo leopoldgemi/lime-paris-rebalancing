@@ -65,7 +65,7 @@ gh workflow run collect-lime-paris      # first manual run; then every 5 min
 Get the data for analysis:
 
 ```bash
-git clone -b data --single-branch https://github.com/<owner>/lime-paris-rebalancing lime-data
+git clone -b data --single-branch https://github.com/leopoldgemi/lime-paris-rebalancing lime-data
 python analyze_snapshots.py --data-dir ../lime-data/data
 ```
 
@@ -78,7 +78,7 @@ reports the real median/max gap between snapshots.
 
 ```bash
 # on a fresh Ubuntu 24.04 VM, as root
-REPO=<owner>/lime-paris-rebalancing bash deploy/setup_vm.sh
+REPO=leopoldgemi/lime-paris-rebalancing bash deploy/setup_vm.sh
 journalctl -u lime-collector -f
 # fetch data to your laptop
 rsync -avz lime@<vm-ip>:lime-paris-rebalancing/data/ ./data/
