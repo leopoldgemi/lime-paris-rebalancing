@@ -1,0 +1,17 @@
+{
+ "last_updated": 1790811751,
+ "ttl": 0,
+ "version": "2.2",
+ "data": {
+  "stations": [
+   {
+    "station_id": "paris",
+    "name": "Paris",
+    "lat": 48.829,
+    "lon": 2.3898
+   }
+  ]
+ },
+ "_fetched_utc": "2026-09-30T23:42:31+00:00",
+ "_source_url": "https://data.lime.bike/api/partners/v2/gbfs/paris/station_information"
+}

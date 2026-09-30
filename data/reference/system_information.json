@@ -1,0 +1,15 @@
+{
+ "last_updated": 1790811751,
+ "ttl": 0,
+ "version": "2.2",
+ "data": {
+  "system_id": "lime_paris",
+  "language": "en",
+  "name": "Lime Paris",
+  "timezone": "Europe/Paris",
+  "license_url": "https://www.li.me/gbfs-terms",
+  "attribution_organization_name": "Lime"
+ },
+ "_fetched_utc": "2026-09-30T23:42:31+00:00",
+ "_source_url": "https://data.lime.bike/api/partners/v2/gbfs/paris/system_information"
+}
