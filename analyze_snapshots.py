@@ -4,7 +4,9 @@ First-look analysis of the collected Lime Paris snapshots.
 
 Reads every snapshot written by collect_lime.py (both formats):
     data/lime_paris_YYYY-MM-DD.csv          (daily CSV, local collector)
-    data/YYYY-MM-DD/HHMMSS.csv.gz           (one file per snapshot, GitHub Actions)
+    data/lime_paris_YYYY-MM-DD.csv.gz       (merged daily file from the "daily-data" release)
+    data/YYYY-MM-DD/HHMMSS.csv.gz           (one file per snapshot, data branch)
+Duplicate (snapshot, bike) rows across formats are dropped.
 
 and writes tables + plots to reports/:
 
@@ -62,7 +64,8 @@ M_PER_DEG_LON = 111_320.0 * math.cos(math.radians(LAT0))
 
 def load_snapshots(data_dir: Path) -> pd.DataFrame:
     files = sorted(glob.glob(str(data_dir / "lime_paris_*.csv")))
-    files += sorted(glob.glob(str(data_dir / "*" / "*.csv.gz")))
+    files += sorted(glob.glob(str(data_dir / "lime_paris_*.csv.gz")))   # merged daily files (release)
+    files += sorted(glob.glob(str(data_dir / "*" / "*.csv.gz")))        # per-snapshot files (data branch)
     if not files:
         sys.exit(f"no snapshot files found under {data_dir}")
     frames = []

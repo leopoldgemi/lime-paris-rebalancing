@@ -27,6 +27,9 @@ position changes of the same id between consecutive snapshots.
 | `collect_lime.py` | collector (requests + stdlib only). Reads feed URLs from the discovery feed, polls `free_bike_status` every 2 min, appends to `data/lime_paris_YYYY-MM-DD.csv`, saves static feeds once to `data/reference/*.json`. Network errors are logged, loop continues. |
 | `analyze_snapshots.py` | first overview (pandas, matplotlib optional): fleet per snapshot, e-bike/scooter split, reserved/disabled/low-battery shares, hourly profile, 500 m grid density, position changes (trip proxy). Output in `reports/`. |
 | `.github/workflows/collect.yml` | GitHub Actions: one snapshot every 5 min, committed to the `data` branch. |
+| `.github/workflows/daily-release.yml` | daily 03:40 UTC: merges yesterday's snapshots into `lime_paris_YYYY-MM-DD.csv.gz` on the release `daily-data`. |
+| `.github/workflows/keepalive.yml` | weekly: empty commit if `main` is older than 45 days (GitHub disables schedules after 60 idle days). |
+| `merge_day.py` | merges one day of per-snapshot files into a single daily csv.gz (stdlib). |
 | `deploy/` | systemd unit + setup script for a small Linux VM; bootstrap script for the `data` branch. |
 
 All paths are relative to the script location, so the repo runs unchanged on any machine.
@@ -62,7 +65,15 @@ bash deploy/bootstrap_data_branch.sh   # creates orphan "data" branch + referenc
 gh workflow run collect-lime-paris      # first manual run; then every 5 min
 ```
 
-Get the data for analysis:
+Get the data for analysis – easiest: the merged daily files from the release
+(one file per UTC day, plus `reference/*.json`):
+
+```bash
+gh release download daily-data -D data/ --clobber      # or download from the Releases page
+python analyze_snapshots.py                              # reads data/lime_paris_*.csv.gz
+```
+
+Raw per-snapshot files (including today's, not yet merged):
 
 ```bash
 git clone -b data --single-branch https://github.com/leopoldgemi/lime-paris-rebalancing lime-data
