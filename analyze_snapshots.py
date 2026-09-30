@@ -189,13 +189,11 @@ def movements(df: pd.DataFrame, threshold_m: float) -> tuple[pd.DataFrame, pd.Da
     # range went UP by a lot while moving -> most likely a battery swap / Lime relocation, not a ride
     moves["likely_operator_move"] = moves["range_delta_m"] > 10_000
     moves["hour_paris"] = moves["snapshot_utc"].dt.tz_convert(PARIS_TZ).dt.hour
-    n_hours = max(1.0, (df["snapshot_utc"].max() - df["snapshot_utc"].min()).total_seconds() / 3600)
     per_hour = moves.groupby("hour_paris").agg(
         moves=("bike_id", "size"),
         median_dist_m=("dist_m", "median"),
         likely_operator_moves=("likely_operator_move", "sum"),
     )
-    per_hour["moves_per_hour_observed"] = per_hour["moves"] / n_hours * 24 / 24  # raw count, see summary
     return moves, per_hour
 
 
@@ -264,7 +262,10 @@ def plot_all(fleet: pd.DataFrame, hourly: pd.DataFrame, grid: pd.DataFrame, per_
 
     fig, ax = plt.subplots(figsize=(7, 7))
     sc = ax.scatter(grid["cell_lon"], grid["cell_lat"], c=grid["mean_vehicles"], s=12, cmap="viridis", marker="s")
-    ax.set_aspect(M_PER_DEG_LON / M_PER_DEG_LAT)
+    ax.set_aspect(M_PER_DEG_LAT / M_PER_DEG_LON)  # metres per degree differ for lat/lon
+    # ignore far-out stragglers so the map shows Paris, not the whole Ile-de-France
+    ax.set_xlim(df["lon"].quantile(0.005) - 0.01, df["lon"].quantile(0.995) + 0.01)
+    ax.set_ylim(df["lat"].quantile(0.005) - 0.005, df["lat"].quantile(0.995) + 0.005)
     ax.set_title("Mean vehicles per grid cell")
     ax.set_xlabel("lon")
     ax.set_ylabel("lat")
@@ -319,7 +320,8 @@ def write_summary(df, fleet, hourly, grid, moves, per_hour, plots, out: Path, gr
         "## E-bike vs scooter (distinct vehicles seen)",
     ]
     for k, v in kinds.items():
-        lines.append(f"- {k}: {v:,}  (mean per snapshot: {fleet[k].mean():.0f})" if k in fleet.columns else f"- {k}: {v:,}")
+        per_snap = f"  (mean per snapshot: {fleet[k].mean():.0f})" if k in fleet.columns else ""
+        lines.append(f"- {k}: {v:,}{per_snap}")
     lines += ["", f"## Spatial density (grid {grid_m:.0f} m, {len(grid)} occupied cells)", "Top 10 cells by mean vehicles:", ""]
     lines.append(grid.head(10).to_string(index=False))
     lines += ["", f"## Position changes between consecutive snapshots (> {thr:.0f} m)",
