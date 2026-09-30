@@ -1,0 +1,8 @@
+# snapshots live on the "data" branch (GitHub Actions) or only locally
+data/
+logs/
+reports/
+__pycache__/
+*.pyc
+.venv/
+.DS_Store

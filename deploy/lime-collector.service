@@ -1,0 +1,20 @@
+# systemd unit for a small Linux VM (Hetzner / Oracle Free Tier / any Debian or Ubuntu box).
+# Install:
+#   sudo cp deploy/lime-collector.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now lime-collector
+# Logs: journalctl -u lime-collector -f   (plus logs/collector.log in the repo dir)
+[Unit]
+Description=Lime Paris GBFS collector (IEOR 4004)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=lime
+WorkingDirectory=/home/lime/lime-paris-rebalancing
+ExecStart=/home/lime/lime-paris-rebalancing/.venv/bin/python collect_lime.py --interval 120
+Restart=always
+RestartSec=30
+
+[Install]
+WantedBy=multi-user.target

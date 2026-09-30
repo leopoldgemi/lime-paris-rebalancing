@@ -1,0 +1,75 @@
+# Collects one Lime Paris free_bike_status snapshot per run and commits it as a
+# gzip file to the "data" branch (data/YYYY-MM-DD/HHMMSS.csv.gz).
+#
+# Caveats (documented in README):
+#  * GitHub schedules are best-effort: "*/5" is the minimum, and runs are often
+#    delayed 5-20 min at busy times (top of the hour is worst). Expect ~200-250
+#    snapshots/day instead of 288.
+#  * Scheduled workflows are disabled after 60 days without repo activity.
+#  * Public repo => Actions minutes are free and unlimited. A private repo
+#    would exhaust the 2000 free min/month within ~10 days.
+name: collect-lime-paris
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: collect
+  cancel-in-progress: false
+
+jobs:
+  snapshot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+    steps:
+      - name: Checkout scripts (main)
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install requests
+        run: pip install --quiet requests
+
+      - name: Clone data branch (partial, no blobs)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # Partial clone: no blobs are downloaded, so the run stays fast even
+          # after the branch holds gigabytes of snapshots. Only the static
+          # reference JSONs are checked out (collector then skips re-fetching them).
+          git clone --quiet --filter=blob:none --no-checkout --depth 1 --branch data \
+            "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" databranch
+          cd databranch
+          git sparse-checkout init --cone
+          git sparse-checkout set data/reference
+          git checkout --quiet data
+          git config user.name "lime-collector[bot]"
+          git config user.email "lime-collector@users.noreply.github.com"
+
+      - name: Take snapshot
+        run: python collect_lime.py --once --gzip-snapshots --no-log-file --data-dir databranch/data
+
+      - name: Commit and push
+        run: |
+          set -euo pipefail
+          cd databranch
+          git add --sparse -A data
+          if git diff --cached --quiet; then
+            echo "nothing to commit"; exit 0
+          fi
+          git commit --quiet -m "snapshot $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          for attempt in 1 2 3 4 5; do
+            if git push --quiet origin HEAD:data; then exit 0; fi
+            echo "push rejected, retrying ($attempt)"; sleep $((attempt * 7))
+            git pull --quiet --rebase origin data
+          done
+          echo "push failed after retries"; exit 1
