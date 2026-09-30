@@ -1,0 +1,59 @@
+# Once a day: merge yesterday's snapshots from the "data" branch into one
+# lime_paris_YYYY-MM-DD.csv.gz and attach it to the GitHub Release "daily-data".
+# Team members then only need:  gh release download daily-data -D data/
+# (release assets do not count towards the git repository size).
+name: daily-release
+
+on:
+  schedule:
+    - cron: "40 3 * * *"        # 03:40 UTC, after the last snapshot of the previous UTC day
+  workflow_dispatch:
+    inputs:
+      day:
+        description: "Day to merge (YYYY-MM-DD, UTC). Default: yesterday"
+        required: false
+
+permissions:
+  contents: write
+
+jobs:
+  merge:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Pick day
+        id: day
+        run: |
+          d="${{ github.event.inputs.day }}"
+          [ -n "$d" ] || d=$(date -u -d 'yesterday' +%F)
+          echo "day=$d" >> "$GITHUB_OUTPUT"
+
+      - name: Fetch that day's snapshots (sparse)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          git clone --quiet --filter=blob:none --no-checkout --depth 1 --branch data \
+            "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" databranch
+          cd databranch
+          git sparse-checkout init --cone
+          git sparse-checkout set "data/${{ steps.day.outputs.day }}" data/reference
+          git checkout --quiet data
+          ls "data/${{ steps.day.outputs.day }}" | wc -l
+
+      - name: Merge
+        run: python merge_day.py "${{ steps.day.outputs.day }}" --data-dir databranch/data --out merged
+
+      - name: Upload to release "daily-data"
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release view daily-data >/dev/null 2>&1 || \
+            gh release create daily-data --title "Daily merged snapshots" \
+              --notes "One lime_paris_YYYY-MM-DD.csv.gz per UTC day, built by daily-release.yml from the data branch. Licence Ouverte 2.0 (Lime)."
+          gh release upload daily-data merged/lime_paris_${{ steps.day.outputs.day }}.csv.gz --clobber
+          # static reference feeds (vehicle_types etc.) alongside the data, cheap to re-upload
+          gh release upload daily-data databranch/data/reference/*.json --clobber
