@@ -34,7 +34,8 @@ recommendation to rotate ids for privacy. Consequences and the workaround are in
 | `reconstruct_trips.py` | classifies consecutive sightings of a chain into trip / ops / unclear, writes `reports/trips.csv`. Thresholds are parameters (top of file + CLI flags). |
 | `trip_stats.py` | trips per hour, event shares, duration/distance distributions, low-range share; PNG plots in `reports/`. |
 | `fetch_parking_zones.py` | downloads Paris Open Data on-street bike parking where free-floating bikes may park, aggregates capacity per grid cell / arrondissement. |
-| `.github/workflows/collect.yml` | GitHub Actions: one snapshot every 5 min, committed to the `data` branch. |
+| `.github/workflows/collect-loop.yml` | **active collector**: self-chaining ~5.5 h jobs, real 2-min polling, commits every 10 min to the `data` branch. |
+| `.github/workflows/collect.yml` | manual single snapshot (the cron schedule never fired; superseded by the loop). |
 | `.github/workflows/daily-release.yml` | daily 03:40 UTC: merges yesterday's snapshots into `lime_paris_YYYY-MM-DD.csv.gz` on the release `daily-data`. |
 | `.github/workflows/keepalive.yml` | weekly: empty commit if `main` is older than 45 days (GitHub disables schedules after 60 idle days). |
 | `merge_day.py` | merges one day of per-snapshot files into a single daily csv.gz (stdlib). |
@@ -65,7 +66,23 @@ vehicle_type, is_reserved, is_disabled, current_range_meters, last_reported`
 | Ops | zero – but scheduled workflows are switched off after 60 days without repo activity | one-time SSH setup (`deploy/setup_vm.sh`), then `systemctl`; someone must keep the VM alive |
 | Failure modes | GitHub outages, missed runs (gaps), workflow silently disabled | VM reboot (systemd restarts it), disk full |
 
-### GitHub Actions setup
+### GitHub Actions: the collection loop
+
+GitHub's cron scheduler never fired for this repo (0 runs in 50 min), so the
+collector runs as a chain of long jobs instead: `collect-loop.yml` polls every
+2 min for 330 min (job limit is 6 h), commits every 10 min, and queues its own
+successor at start via `workflow_dispatch`. The concurrency group holds the
+successor until the current run ends or crashes, so there is no gap. An hourly
+cron only re-seeds the chain if it ever breaks.
+
+```bash
+gh workflow run collect-loop.yml                 # start (or re-seed) the chain
+gh run list --workflow collect-loop --limit 3    # one in_progress + one pending = healthy
+```
+
+To stop: cancel the running and the queued run in the Actions tab.
+
+### GitHub Actions setup (one-time)
 
 ```bash
 gh repo create lime-paris-rebalancing --public --source . --push
