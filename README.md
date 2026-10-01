@@ -80,6 +80,13 @@ gh workflow run collect-loop.yml                 # start (or re-seed) the chain
 gh run list --workflow collect-loop --limit 3    # one in_progress + one pending = healthy
 ```
 
+The successor is dispatched twice: at start (covers crashes) and again right
+before the job ends (the start-queued run once stayed "pending" after its
+predecessor finished, causing a 73-min gap on 2026-10-01; a fresh dispatch at
+the end starts within seconds). GitHub keeps only one pending run per
+concurrency group, so a newer dispatch (or the hourly cron) simply replaces
+the older pending one. Handover gap is ~3 min (one missed snapshot).
+
 To stop: cancel the running and the queued run in the Actions tab.
 
 ### GitHub Actions setup (one-time)

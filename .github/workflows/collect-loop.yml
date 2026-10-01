@@ -83,3 +83,13 @@ jobs:
           done
           wait "$COLLECTOR" || true
           commit_push
+
+      # Belt and braces: the run queued at start did not always start when its
+      # predecessor finished (observed 2026-10-01: 73-min gap). Re-dispatching
+      # here replaces that stale pending run with a fresh one that starts within
+      # seconds of this job ending.
+      - name: Re-queue the successor right before finishing
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run collect-loop.yml --ref "$GITHUB_REF_NAME" || echo "could not queue successor (cron will re-seed)"
