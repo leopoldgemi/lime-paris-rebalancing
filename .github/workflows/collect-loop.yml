@@ -1,0 +1,85 @@
+# Continuous 2-minute polling on GitHub Actions without relying on the cron
+# scheduler: one job polls for ~5.5 h (job limit is 6 h), commits every 10 min
+# to the "data" branch, and the NEXT run is dispatched at the START of each run
+# so it waits in the concurrency queue and starts the moment this one ends
+# (or crashes). The hourly cron is only a watchdog that re-seeds the chain if
+# it ever breaks (its runs are cancelled by the concurrency group while a loop
+# is running or already queued).
+#
+# Start the chain once:  gh workflow run collect-loop.yml
+# Stop it:               cancel the running AND the queued run in the Actions tab.
+name: collect-loop
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "23 * * * *"
+
+permissions:
+  contents: write
+  actions: write
+
+concurrency:
+  group: collect-loop
+  cancel-in-progress: false
+
+env:
+  POLL_SECONDS: 120
+  LOOP_MINUTES: 330
+
+jobs:
+  loop:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Queue the next run (waits in the concurrency group until this one ends)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run collect-loop.yml --ref "$GITHUB_REF_NAME" || echo "could not queue successor (will be re-seeded by cron)"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install --quiet requests
+
+      - name: Clone data branch (partial, no blobs)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          git clone --quiet --filter=blob:none --no-checkout --depth 1 --branch data \
+            "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" databranch
+          cd databranch
+          git sparse-checkout init --cone
+          git sparse-checkout set data/reference
+          git checkout --quiet data
+          git config user.name "lime-collector[bot]"
+          git config user.email "lime-collector@users.noreply.github.com"
+
+      - name: Poll for ~5.5 h, commit every 10 min
+        run: |
+          set -uo pipefail
+          python collect_lime.py --interval "$POLL_SECONDS" --duration-minutes "$LOOP_MINUTES" \
+            --gzip-snapshots --no-log-file --data-dir databranch/data &
+          COLLECTOR=$!
+          commit_push() {
+            cd databranch
+            git add --sparse -A data
+            if git diff --cached --quiet; then cd ..; return 0; fi
+            n=$(git diff --cached --name-only | wc -l)
+            git commit --quiet -m "snapshots $(date -u +%Y-%m-%dT%H:%M:%SZ) (+$n)"
+            for attempt in 1 2 3 4 5; do
+              if git push --quiet origin HEAD:data; then cd ..; return 0; fi
+              echo "push rejected, retrying ($attempt)"; sleep $((attempt * 7))
+              git pull --quiet --rebase origin data || true
+            done
+            echo "push failed after retries"; cd ..; return 1
+          }
+          while kill -0 "$COLLECTOR" 2>/dev/null; do
+            sleep 600
+            commit_push || true
+          done
+          wait "$COLLECTOR" || true
+          commit_push
