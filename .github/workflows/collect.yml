@@ -10,9 +10,9 @@
 #    would exhaust the 2000 free min/month within ~10 days.
 name: collect-lime-paris
 
+# Superseded by collect-loop.yml (continuous 2-min polling). Kept as a manual
+# single-snapshot tool; the cron schedule never fired in this repo anyway.
 on:
-  schedule:
-    - cron: "2-59/5 * * * *"   # :02, :07, ... avoids the congested top of the hour
   workflow_dispatch:
 
 permissions:
