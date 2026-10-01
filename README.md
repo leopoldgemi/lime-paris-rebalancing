@@ -17,8 +17,11 @@ positions, so we record them ourselves from the public GBFS feed.
 | `station_information` / `station_status` | one dummy "station" covering all of Paris – no real docks. Useless. |
 | `geofencing_zones` | **not offered** (not listed in discovery, direct URL gives 404). |
 
-`bike_id` appears stable across snapshots, so trips can be reconstructed as
-position changes of the same id between consecutive snapshots.
+**`bike_id` is NOT stable.** Lime replaces every id in the feed at once, about
+every 15 minutes (observed boundaries at ~23:45 and 00:00 UTC on 2026-09-30;
+0 % id overlap across the boundary, 99 % within an epoch). This follows the GBFS
+recommendation to rotate ids for privacy. Consequences and the workaround are in
+"Id rotation" below.
 
 ## Files
 
@@ -26,6 +29,11 @@ position changes of the same id between consecutive snapshots.
 |---|---|
 | `collect_lime.py` | collector (requests + stdlib only). Reads feed URLs from the discovery feed, polls `free_bike_status` every 2 min, appends to `data/lime_paris_YYYY-MM-DD.csv`, saves static feeds once to `data/reference/*.json`. Network errors are logged, loop continues. |
 | `analyze_snapshots.py` | first overview (pandas, matplotlib optional): fleet per snapshot, e-bike/scooter split, reserved/disabled/low-battery shares, hourly profile, 500 m grid density, position changes (trip proxy). Output in `reports/`. |
+| `check_id_stability.py` | id overlap first vs last snapshot, new/gone ids per snapshot, rotation boundaries, day-to-day overlap. |
+| `linking.py` | re-links ids across rotations via the (lat, lon, range) fingerprint of parked bikes, gives a chain id `uid`. |
+| `reconstruct_trips.py` | classifies consecutive sightings of a chain into trip / ops / unclear, writes `reports/trips.csv`. Thresholds are parameters (top of file + CLI flags). |
+| `trip_stats.py` | trips per hour, event shares, duration/distance distributions, low-range share; PNG plots in `reports/`. |
+| `fetch_parking_zones.py` | downloads Paris Open Data on-street bike parking where free-floating bikes may park, aggregates capacity per grid cell / arrondissement. |
 | `.github/workflows/collect.yml` | GitHub Actions: one snapshot every 5 min, committed to the `data` branch. |
 | `.github/workflows/daily-release.yml` | daily 03:40 UTC: merges yesterday's snapshots into `lime_paris_YYYY-MM-DD.csv.gz` on the release `daily-data`. |
 | `.github/workflows/keepalive.yml` | weekly: empty commit if `main` is older than 45 days (GitHub disables schedules after 60 idle days). |
@@ -94,6 +102,82 @@ journalctl -u lime-collector -f
 # fetch data to your laptop
 rsync -avz lime@<vm-ip>:lime-paris-rebalancing/data/ ./data/
 ```
+
+## Analysis pipeline
+
+```bash
+python check_id_stability.py          # is bike_id stable? rotation boundaries, link rate
+python reconstruct_trips.py           # -> reports/trips.csv   (flags: --min-trip-dist-m 300 ...)
+python trip_stats.py                  # -> reports/trip_stats.md + png
+python fetch_parking_zones.py         # -> reports/parking_capacity_grid.csv
+```
+
+### Id rotation and linking (`linking.py`)
+
+- A rotation is detected when the id overlap between two consecutive snapshots
+  is below `ROTATION_THRESHOLD = 0.5`.
+- Across a rotation, a new id is linked to a vanished id if both have the same
+  fingerprint `(round(lat, 6), round(lon, 6), current_range_meters)` and the
+  fingerprint is unique on both sides. Parked bikes keep this fingerprint
+  exactly. Observed link rate: 91 % across a 15-min gap, 98 % across 2 min.
+- The chain id `uid` is the bike_id of the first sighting. A bike that is riding
+  (or in a van) during a rotation cannot be linked: its chain ends, a new chain
+  starts, and that trip is lost. Expected loss ≈ polling interval / 15 min
+  (≈ 13 % of trips at 2-min polling, ≈ 33 % at 5-min polling). Trips are
+  therefore undercounted; the hourly profile shape is unaffected if the loss is
+  time-independent.
+- Within an epoch ids follow the bike through a ride (verified: same id, new
+  position, lower range).
+
+### Event classification (`reconstruct_trips.py`)
+
+An event is a pair of consecutive sightings of one chain (A at `t_prev`, B at `t_next`).
+
+| Parameter | Default | Meaning |
+|---|---|---|
+| `MIN_TRIP_DIST_M` | 200 | displacement below this is not a relocation (GPS jitter) |
+| `STATIONARY_DIST_M` | 50 | below this the bike has not moved at all |
+| `MIN_TRIP_MIN` / `MAX_TRIP_MIN` | 2 / 90 | plausible gap between sightings for a ride |
+| `RANGE_TOL_M` | 500 | range may rise by up to this (sensor noise) and still count as a ride |
+| `RANGE_INCREASE_OPS_M` | 5 000 | range rise above this = battery swap (ops) |
+| `OPS_BATCH_MIN_BIKES` / `OPS_BATCH_RADIUS_M` | 4 / 100 | ≥ 4 bikes reappearing in the same snapshot in one 100 m cell = van drop-off (ops) |
+| `MAX_STILL_GAP_MIN` | 90 | same position but absent longer than this = unclear |
+
+Rules, first match wins:
+
+1. `ops` – range rose by > `RANGE_INCREASE_OPS_M` (in place or relocated)
+2. `ops` – relocated and part of a batch drop-off
+3. `trip` – relocated ≥ `MIN_TRIP_DIST_M`, gap within [`MIN_TRIP_MIN`, `MAX_TRIP_MIN`], range delta ≤ `RANGE_TOL_M`
+4. `unclear` – relocated but gap > `MAX_TRIP_MIN` (long absence), gap < `MIN_TRIP_MIN`, or moderate range rise
+5. `unclear` – same position but gap > `MAX_STILL_GAP_MIN`; small displacement (50–200 m) after an absence
+6. ignored – same position, short gap (still parked); jitter without absence
+
+Assumptions behind this:
+
+- Lime hides a bike from the feed while it is rented (and in a van). Absence
+  therefore means "in use or in operations", presence means "available".
+- Duration = gap between last sighting at A and first sighting at B, so it
+  overstates the ride by up to one polling interval plus idle time at B.
+- Distance is straight-line between A and B, not the ridden route.
+- A battery swap raises `current_range_meters` by tens of km; rides only lower it.
+- Van pick-ups are invisible as such (the bike just vanishes); only drop-offs
+  are detectable, via the batch rule or the range jump.
+- Reserved bikes stay in the feed (`is_reserved = 1`); they are not treated specially yet.
+
+### Parking capacity (Paris Open Data)
+
+Dataset `stationnement-voie-publique-emplacements` (licence ODbL) has 65 833
+on-street parking spots with a field
+`stationnement_autorises_aux_velos_en_libre_service`. 12 997 spots are "oui"
+(all `regpar = "Vélos"`, i.e. bike racks), with `placal` = computed places:
+**137 864 places** in total, 3 300–10 300 per arrondissement. This is the
+legal parking capacity for free-floating bikes per zone (Paris requires
+free-floating bikes to be parked on these racks or in dedicated bays).
+`fetch_parking_zones.py` aggregates it on the same 500 m grid as the
+snapshot density, so capacity − mean vehicles gives free parking per cell.
+Caveats: capacity is shared with private bikes and other operators (Vélib'
+stations are separate records, `regpar = "Vélib'"`); the city does not
+guarantee completeness.
 
 ## Politeness
 
