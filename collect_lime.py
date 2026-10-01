@@ -246,9 +246,14 @@ class Collector:
             log.info("feed ttl %ss > interval %ss; polling more often is pointless", ttl, self.interval_s)
         return True
 
-    def run_forever(self) -> None:
-        log.info("starting loop: every %ss, data_dir=%s", self.interval_s, self.data_dir)
+    def run_forever(self, duration_s: float | None = None) -> None:
+        log.info("starting loop: every %ss, data_dir=%s, duration=%s", self.interval_s, self.data_dir,
+                 f"{duration_s/60:.0f} min" if duration_s else "unlimited")
+        deadline = time.monotonic() + duration_s if duration_s else None
         while not self.stop:
+            if deadline and time.monotonic() >= deadline:
+                log.info("duration reached")
+                break
             t0 = time.monotonic()
             try:
                 self.poll_once()
@@ -277,6 +282,8 @@ def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--interval", type=int, default=DEFAULT_INTERVAL_S, help="seconds between polls (default 120)")
     p.add_argument("--once", action="store_true", help="take a single snapshot and exit")
+    p.add_argument("--duration-minutes", type=float, default=None,
+                   help="stop the loop after this many minutes (used by the GitHub Actions loop job)")
     p.add_argument("--data-dir", default="data", help="output directory, relative to this script (default: data)")
     p.add_argument("--gzip-snapshots", action="store_true",
                    help="one gzip file per snapshot (data/YYYY-MM-DD/HHMMSS.csv.gz) instead of daily CSV")
@@ -304,7 +311,7 @@ def main(argv: list[str] | None = None) -> int:
         except Exception as exc:  # noqa: BLE001
             log.error("single poll failed: %s", exc)
             return 1
-    c.run_forever()
+    c.run_forever(duration_s=args.duration_minutes * 60 if args.duration_minutes else None)
     return 0
 
 
