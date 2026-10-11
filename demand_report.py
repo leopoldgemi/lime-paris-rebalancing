@@ -57,11 +57,18 @@ def rentals_by_hour(qdir: Path, out: Path, plt) -> None:
         .to_csv(out / "rentals_by_hour.csv")
     fig, ax = plt.subplots(figsize=(9, 4.6), dpi=150)
     style(ax, plt)
-    for we, col, lab in ((False, BLUE, "Weekday"), (True, ORANGE, "Weekend")):
-        x = h.loc[we]["departures_per_h"]
+    series = [(we, col, lab, h.loc[we]["departures_per_h"])
+              for we, col, lab in ((False, BLUE, "Weekday"), (True, ORANGE, "Weekend")) if we in h.index]
+    ends = {lab: x.values[-1] for _, _, lab, x in series}
+    gap = 0.045 * max(x.max() for *_, x in series)              # keep end labels apart
+    if len(ends) == 2:
+        lo, hi = sorted(ends, key=ends.get)
+        if ends[hi] - ends[lo] < gap:
+            mid = (ends[hi] + ends[lo]) / 2
+            ends[lo], ends[hi] = mid - gap / 2, mid + gap / 2
+    for we, col, lab, x in series:
         ax.plot(x.index, x.values, color=col, lw=2, marker="o", ms=4, label=lab)
-        ax.annotate(lab, (x.index[-1], x.values[-1]), xytext=(6, 0), textcoords="offset points",
-                    color=INK, fontsize=9, va="center")
+        ax.annotate(lab, (x.index[-1] + 0.4, ends[lab]), color=INK, fontsize=9, va="center")
     ax.set_xticks(range(0, 24, 2))
     ax.set_xlim(-0.5, 25.5)
     ax.set_ylim(bottom=0)
