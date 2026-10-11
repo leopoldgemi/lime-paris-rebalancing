@@ -17,13 +17,22 @@ A departure of zone i between snapshots t and t+1 is a bike that was in zone i
 at t and, at t+1, is either in a different zone or absent from the feed (Lime
 hides a bike while it is rented or in a van). Arrivals are the mirror image.
 
-Feed blips are removed. About 19 % of disappearances are a bike dropping out of
-the feed for a few minutes and coming back at exactly the same coordinates;
-those are not trips. A disappearance is discarded when the identical position
-(lat, lon rounded to 5 decimals, about 1 m) is occupied again within
---blip-lookahead snapshots, and the matching reappearance is discarded from the
-arrivals. The position test survives Lime's 15-minute id rotation, which an
-id-based test does not.
+Feed blips are removed. Many disappearances are a bike dropping out of the feed
+for a few minutes and coming back almost where it was, with almost the same
+range; those are not trips. Every disappearance and every appearance in the file
+(including those at id rotations) is an event. A counted departure is a blip if
+some appearance follows within --blip-window-min (16) minutes, at most
+--blip-radius-m (50) metres away and with at most --blip-range-m (300) metres
+range difference; a counted arrival is a blip if such a disappearance precedes
+it. The rule is symmetric, so each blip removes one departure and one arrival.
+Matching by position and range survives Lime's 15-minute id rotation, which an
+id-based test does not. A parked neighbour can match by chance (about 2 % of
+departures in a control run with ranges shifted by 5 km).
+
+Flicker is removed too: a bike_id visible in exactly one snapshot (absent in the
+snapshots before and after) creates neither a return nor a rental (--keep-flicker
+turns this off). A real ride ending and the bike being taken again within about
+one polling interval is lost this way; that is a small share (see PR notes).
 
 A bike that stays visible but lands in another zone counts only if it moved more
 than --min-move-m (default 200 m); shorter hops are GPS jitter at a boundary.
@@ -49,11 +58,11 @@ import argparse
 import glob
 import json
 import sys
-from collections import deque
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
+from scipy.spatial import cKDTree
 
 from analyze_snapshots import BASE_DIR, M_PER_DEG_LAT, M_PER_DEG_LON, PARIS_TZ
 
@@ -66,7 +75,10 @@ EBIKE_TYPE = "3"
 ROTATION_OVERLAP = 0.5      # id overlap below this = rotation, pair unusable
 MAX_PAIR_GAP_MIN = 6.0      # ignore snapshot pairs further apart than this
 MIN_MOVE_M = 200.0          # a visible bike changing zone counts only if it moved further than this
-FP_DECIMALS = 5             # position rounding for the blip test (~1 m)
+FP_DECIMALS = 5             # position rounding (~1 m) for the zone lookup cache
+BLIP_WINDOW_MIN = 16.0      # a disappearance and an appearance this close in time ...
+BLIP_RADIUS_M = 50.0        # ... and in space ...
+BLIP_RANGE_M = 300.0        # ... and in current_range_meters are one bike blinking, not a trip
 USECOLS = ["snapshot_utc", "bike_id", "lat", "lon", "vehicle_type_id", "is_reserved",
            "current_range_meters"]
 
@@ -150,12 +162,12 @@ def snapshot_record(t, g: pd.DataFrame, zoning: Zoning, period_min: int, min_ran
     z = pd.Series(zones, index=g["bike_id"].to_numpy())
     lat5 = g["lat"].round(FP_DECIMALS).to_numpy()
     lon5 = g["lon"].round(FP_DECIMALS).to_numpy()
-    fp_of = dict(zip(g["bike_id"].to_numpy(), zip(lat5, lon5)))
     # "available" follows the brief: not reserved and enough range to be rentable
     ok = (g["is_reserved"].to_numpy() == 0) & (g["current_range_meters"].to_numpy() >= min_range_m)
     inv = pd.Series(zones[ok]).value_counts()
-    return {"t": t, "ids": set(z.index), "zone": z, "fp": set(zip(lat5, lon5)), "fp_of": fp_of,
-            "inv": inv, "lat": pd.Series(lat5, index=g["bike_id"].to_numpy()),
+    return {"t": t, "ids": set(z.index), "zone": z, "inv": inv,
+            "rng": pd.Series(g["current_range_meters"].to_numpy(dtype=float), index=g["bike_id"].to_numpy()),
+            "lat": pd.Series(lat5, index=g["bike_id"].to_numpy()),
             "lon": pd.Series(lon5, index=g["bike_id"].to_numpy()),
             "period": (local.hour * 60 + local.minute) // period_min,
             "weekend": local.dayofweek >= 5}
@@ -173,7 +185,55 @@ def ops_cluster_mask(a: dict, bikes: list, radius_m: float, min_bikes: int) -> s
     return set(cell[cell.isin(big)].index)
 
 
-def resolve_pair(a: dict, b: dict, lookahead: list[dict], lookback: list[dict],
+class BlipIndex:
+    """All disappearances / appearances of one file, searchable by time, position and range."""
+
+    def __init__(self, recs: list[dict], window_min: float, radius_m: float, range_m: float,
+                 range_shift: float = 0.0):
+        self.window_s, self.radius, self.range_m, self.shift = window_min * 60, radius_m, range_m, range_shift
+        dis, app = [], []
+        for a, b in zip(recs, recs[1:]):
+            # flicker sightings are not events: the bike counts as absent throughout
+            for src, ids, out in ((a, a["ids"] - b["ids"] - a.get("flicker", set()), dis),
+                                  (b, b["ids"] - a["ids"] - b.get("flicker", set()), app)):
+                if ids:
+                    ids = list(ids)
+                    out.append(pd.DataFrame({"t": src["t"].timestamp(), "y": src["lat"].loc[ids].to_numpy() * M_PER_DEG_LAT,
+                                             "x": src["lon"].loc[ids].to_numpy() * M_PER_DEG_LON,
+                                             "r": src["rng"].loc[ids].to_numpy()}))
+        self.dis = self._index(dis)
+        self.app = self._index(app)
+
+    def _index(self, parts):
+        d = pd.concat(parts, ignore_index=True) if parts else pd.DataFrame(columns=["t", "x", "y", "r"])
+        d = d.dropna()
+        pts = np.column_stack([d["x"], d["y"], d["r"] * self.radius / max(self.range_m, 1e-9)])
+        return d[["t", "x", "y", "r"]].to_numpy(dtype=float), (cKDTree(pts) if len(d) else None)
+
+    def mask(self, rec: dict, ids: list, forward: bool) -> np.ndarray:
+        """True for each bike of `rec` that has a matching appearance after (forward) or
+        disappearance before (not forward) within the blip window."""
+        arr, tree = self.app if forward else self.dis
+        res = np.zeros(len(ids), dtype=bool)
+        if tree is None or not ids:
+            return res
+        y = rec["lat"].loc[ids].to_numpy() * M_PER_DEG_LAT
+        x = rec["lon"].loc[ids].to_numpy() * M_PER_DEG_LON
+        r = rec["rng"].loc[ids].to_numpy() + self.shift
+        t0 = rec["t"].timestamp()
+        q = np.column_stack([x, y, r * self.radius / max(self.range_m, 1e-9)])
+        for i, hits in enumerate(tree.query_ball_point(q, r=self.radius, p=np.inf)):
+            if not hits:
+                continue
+            h = arr[hits]
+            dt = h[:, 0] - t0 if forward else t0 - h[:, 0]
+            ok = (dt > 0) & (dt <= self.window_s) & (np.abs(h[:, 3] - r[i]) <= self.range_m) \
+                & (np.hypot(h[:, 1] - x[i], h[:, 2] - y[i]) <= self.radius)
+            res[i] = ok.any()
+        return res
+
+
+def resolve_pair(a: dict, b: dict, blips: BlipIndex,
                  ops_radius_m: float, ops_min_bikes: int, min_move_m: float = MIN_MOVE_M):
     """Departures/arrivals per zone for the pair (a, b), feed blips removed."""
     gap = (b["t"] - a["t"]).total_seconds() / 60
@@ -196,25 +256,24 @@ def resolve_pair(a: dict, b: dict, lookahead: list[dict], lookback: list[dict],
     arr_zones = [zb.loc[moved.index]]
 
     # bikes that left the feed; drop feed blips and van pick-ups
-    gone = sorted(a["ids"] - b["ids"])
-    n_ops = 0
+    gone = sorted(a["ids"] - b["ids"] - a["flicker"])
+    n_ops = n_blip_dep = n_blip_arr = 0
+    n_flicker = len((a["ids"] - b["ids"]) & a["flicker"])
     if gone:
-        future = set()
-        for s in lookahead:
-            future |= s["fp"]
-        real_gone = [bid for bid in gone if a["fp_of"][bid] not in future]
+        blip = blips.mask(a, gone, forward=True)
+        n_blip_dep = int(blip.sum())
+        real_gone = [bid for bid, bl in zip(gone, blip) if not bl]
         ops = ops_cluster_mask(a, real_gone, ops_radius_m, ops_min_bikes)
         n_ops = len(ops)
         real_gone = [bid for bid in real_gone if bid not in ops]
         dep_zones.append(a["zone"].loc[real_gone])
 
-    # bikes that entered the feed; drop those returning to a position seen just before
-    appeared = sorted(b["ids"] - a["ids"])
+    # bikes that entered the feed; drop the reappearance half of a blip
+    appeared = sorted(b["ids"] - a["ids"] - b["flicker"])
     if appeared:
-        past = set()
-        for s in lookback:
-            past |= s["fp"]
-        real_new = [bid for bid in appeared if b["fp_of"][bid] not in past]
+        blip = blips.mask(b, appeared, forward=False)
+        n_blip_arr = int(blip.sum())
+        real_new = [bid for bid, bl in zip(appeared, blip) if not bl]
         arr_zones.append(b["zone"].loc[real_new])
 
     dep = pd.concat(dep_zones).value_counts() if dep_zones else pd.Series(dtype=int)
@@ -224,12 +283,13 @@ def resolve_pair(a: dict, b: dict, lookahead: list[dict], lookback: list[dict],
                           "departures": dep.reindex(zones, fill_value=0).to_numpy(),
                           "arrivals": arr.reindex(zones, fill_value=0).to_numpy()})
     return flows, {"period": b["period"], "weekend": b["weekend"], "minutes": gap,
-                   "ops_excluded": n_ops}
+                   "ops_excluded": n_ops, "blip_departures": n_blip_dep, "blip_arrivals": n_blip_arr,
+                   "flicker": n_flicker}
 
 
-def process_file(path: str, zoning: Zoning, period_min: int, look: int,
+def process_file(path: str, zoning: Zoning, period_min: int, blip_params: tuple,
                  min_range_m: float, ops_radius_m: float, ops_min_bikes: int,
-                 min_move_m: float = MIN_MOVE_M):
+                 min_move_m: float = MIN_MOVE_M, drop_flicker: bool = True):
     """Return (flows, presence, pairs, snaps) for one file of snapshots."""
     df = pd.read_csv(path, usecols=USECOLS,
                      dtype={"bike_id": "string", "vehicle_type_id": "string"},
@@ -237,35 +297,31 @@ def process_file(path: str, zoning: Zoning, period_min: int, look: int,
     df = df[df["vehicle_type_id"] == EBIKE_TYPE]
     df["snapshot_utc"] = pd.to_datetime(df["snapshot_utc"], utc=True)
 
-    flows, presence, pairs, snaps = [], [], [], []
-    window: deque = deque()
-    history: deque = deque(maxlen=look)
+    recs = [snapshot_record(t, g, zoning, period_min, min_range_m)
+            for t, g in df.groupby("snapshot_utc", sort=True)]
+    # flicker: an id visible in exactly one snapshot creates neither a return nor a rental
+    for k, r in enumerate(recs):
+        if 0 < k < len(recs) - 1 and drop_flicker:
+            r["flicker"] = r["ids"] - recs[k - 1]["ids"] - recs[k + 1]["ids"]
+        else:
+            r["flicker"] = set()
+    blips = BlipIndex(recs, *blip_params)
 
-    def emit(k: int):
-        a, b = window[k], window[k + 1]
-        out = resolve_pair(a, b, list(window)[k + 2:k + 2 + look], list(history),
-                           ops_radius_m, ops_min_bikes, min_move_m)
+    flows, pairs = [], []
+    for a, b in zip(recs, recs[1:]):
+        out = resolve_pair(a, b, blips, ops_radius_m, ops_min_bikes, min_move_m)
         if out is not None:
             flows.append(out[0])
             pairs.append(out[1])
-
-    for t, g in df.groupby("snapshot_utc", sort=True):
-        rec = snapshot_record(t, g, zoning, period_min, min_range_m)
-        snaps.append({"period": rec["period"], "weekend": rec["weekend"]})
-        presence.append(pd.DataFrame({"zone": rec["inv"].index, "period": rec["period"],
-                                      "weekend": rec["weekend"], "bikes": rec["inv"].to_numpy()}))
-        window.append(rec)
-        if len(window) == look + 2:
-            emit(0)
-            history.append(window.popleft())
-    while len(window) >= 2:                       # flush with shrinking lookahead
-        emit(0)
-        history.append(window.popleft())
+    presence = [pd.DataFrame({"zone": r["inv"].index, "period": r["period"], "weekend": r["weekend"],
+                              "bikes": r["inv"].to_numpy()}) for r in recs]
+    snaps = [{"period": r["period"], "weekend": r["weekend"]} for r in recs]
 
     empty = pd.DataFrame(columns=["zone", "period", "weekend", "departures", "arrivals"])
     return (pd.concat(flows, ignore_index=True) if flows else empty,
             pd.concat(presence, ignore_index=True) if presence else pd.DataFrame(columns=["zone", "period", "weekend", "bikes"]),
-            pd.DataFrame(pairs, columns=["period", "weekend", "minutes", "ops_excluded"]),
+            pd.DataFrame(pairs, columns=["period", "weekend", "minutes", "ops_excluded",
+                                         "blip_departures", "blip_arrivals", "flicker"]),
             pd.DataFrame(snaps, columns=["period", "weekend"]))
 
 
@@ -287,8 +343,14 @@ def main(argv=None) -> int:
                         "more than this many metres between the two snapshots (default 200, 0 disables)")
     p.add_argument("--period-minutes", type=int, default=20,
                    help="length of one model period in minutes; must divide 1440 (default 20)")
-    p.add_argument("--blip-lookahead", type=int, default=8,
-                   help="snapshots to look ahead when testing for a feed blip (default 8 = ~16 min)")
+    p.add_argument("--keep-flicker", action="store_true",
+                   help="count bikes visible in only one snapshot as return + rental (default: dropped)")
+    p.add_argument("--blip-window-min", type=float, default=BLIP_WINDOW_MIN,
+                   help="max minutes between a disappearance and a reappearance of a blip (default 16)")
+    p.add_argument("--blip-radius-m", type=float, default=BLIP_RADIUS_M,
+                   help="max distance between disappearance and reappearance of a blip (default 50)")
+    p.add_argument("--blip-range-m", type=float, default=BLIP_RANGE_M,
+                   help="max current_range_meters difference of a blip (default 300)")
     p.add_argument("--censoring-correction", action="store_true")
     p.add_argument("--min-departures", type=float, default=0.5,
                    help="drop zones whose busiest period has fewer departures/h than this")
@@ -310,9 +372,10 @@ def main(argv=None) -> int:
     zoning = Zoning(a.zones, a.grid_m)
     all_flows, all_pres, all_pairs, all_snaps = [], [], [], []
     for f in files:
-        fl, pr, pa, sn = process_file(f, zoning, a.period_minutes, a.blip_lookahead,
+        fl, pr, pa, sn = process_file(f, zoning, a.period_minutes,
+                                      (a.blip_window_min, a.blip_radius_m, a.blip_range_m),
                                       a.min_range_m, a.ops_cluster_radius, a.ops_cluster_min,
-                                      a.min_move_m)
+                                      a.min_move_m, not a.keep_flicker)
         all_flows.append(fl); all_pres.append(pr); all_pairs.append(pa); all_snaps.append(sn)
         print(f"  {Path(f).name}: {len(sn):,} snapshots, {len(pa):,} usable pairs "
               f"({pa['minutes'].sum() / 60:.1f} h), {fl['departures'].sum():,} departures, "
@@ -401,7 +464,11 @@ def main(argv=None) -> int:
         + f", {n_periods} periods of {a.period_minutes} min",
         f"- zones kept {len(zones)} (dropped {dropped} below {a.min_departures} departures/h)",
         f"- censoring correction: {'on' if a.censoring_correction else 'off'}",
-        f"- blip filter: disappearances returning to the same position within {a.blip_lookahead} snapshots are dropped",
+        f"- flicker filter: {'off' if a.keep_flicker else 'on'} (bikes visible in a single snapshot; "
+        f"{pairs['flicker'].sum():,} dropped)",
+        f"- blip filter: disappearance + appearance within {a.blip_window_min:.0f} min, <= {a.blip_radius_m:.0f} m, "
+        f"<= {a.blip_range_m:.0f} m range difference ({pairs['blip_departures'].sum():,} departures and "
+        f"{pairs['blip_arrivals'].sum():,} arrivals removed)",
         f"- operations filter: >= {a.ops_cluster_min} bikes vanishing within {a.ops_cluster_radius:.0f} m of each "
         f"other in one transition ({pairs['ops_excluded'].sum():,} bikes excluded, "
         f"{pairs['ops_excluded'].sum() / max(1, pairs['ops_excluded'].sum() + flows['departures'].sum()):.1%} "
@@ -410,15 +477,16 @@ def main(argv=None) -> int:
         f"- availability: not reserved and range >= {a.min_range_m / 1000:.0f} km",
         f"- outside Paris intra-muros: {out_share:.1%} of departures, dropped",
         "",
-        "| | rentals/day | peak period | peak rate |",
-        "|---|---|---|---|",
+        "| | rentals/day | returns/day | rentals per bike/day | peak period | peak rate |",
+        "|---|---|---|---|---|---|",
     ]
     for lab, g in (("weekday", wd), ("weekend", we)):
         if not len(g):
             continue
         s = g.groupby("period")["departures_per_h"].sum()
         pk = s.idxmax()
-        lines.append(f"| {lab} | {per_day(g):,.0f} | "
+        ret = g.groupby("period")["arrivals_per_h"].sum().mean() * 24
+        lines.append(f"| {lab} | {per_day(g):,.0f} | {ret:,.0f} | {per_day(g) / fleet_est:.1f} | "
                      f"{pk * a.period_minutes // 60:02d}:{pk * a.period_minutes % 60:02d} | {s.max():,.0f}/h |")
     lines += [
         "",

@@ -1,5 +1,6 @@
-# collector needs only requests; analysis needs pandas (+ matplotlib for plots, shapely for build_demand.py)
+# collector needs only requests; analysis needs pandas (+ matplotlib for plots, shapely + scipy for build_demand.py)
 requests>=2.28
 pandas>=2.0
 matplotlib>=3.7
 shapely>=2.0
+scipy>=1.10
