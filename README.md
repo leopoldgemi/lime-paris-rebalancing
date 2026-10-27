@@ -40,6 +40,7 @@ recommendation to rotate ids for privacy. Consequences and the workaround are in
 | `.github/workflows/keepalive.yml` | weekly: empty commit if `main` is older than 45 days (GitHub disables schedules after 60 idle days). |
 | `build_model_inputs.py` | LP inputs on a 300 m grid: night inventory s, returns r, empty-minute-corrected demand d per cell/hour/day, distances (see "Model"). |
 | `lp_model.py` | LP rebalancing model in gurobipy (see "Model"). |
+| `plot_plan_map.py` | map of a night plan: cells coloured by net inflow, arrondissement borders. |
 | `merge_day.py` | merges one day of per-snapshot files into a single daily csv.gz (stdlib). |
 | `deploy/` | systemd unit + setup script for a small Linux VM; bootstrap script for the `data` branch. |
 
@@ -231,14 +232,15 @@ The LP chooses the night plan with the lowest cost of relocation plus lost trips
 | s_i | bikes in the cell at night (01:00 weekday, 03:00 weekend), mean over days | data |
 | r_itk | returns (trip ends) | data |
 | pi_jtk | r_jtk / sum_j r_jtk: share of the returns of hour t, day k that end in cell j | data |
-| alpha | share of the bikes returned in an hour that can be rented again in the same hour | 0.5 |
+| alpha | share of the bikes returned in an hour that can be rented again in the same hour | 0.5 weekday, 0.75 weekend |
 | d_itk | demand = rentals corrected for minutes without any available bike | data |
 | A | pairs i != j with dist_ij <= R | R = 1.5 km |
 | p, h, v, Q, M | lost profit per trip, handling cost per bike, van cost per km, bikes per van, limit | 3.50, 0.67, 1.30, 15, off |
 
 alpha = 0.5 is calibrated: with x = 0 the model then serves 56,263 trips per
 weekday against 56,464 observed rentals (-0.4 %; alpha 0 / 0.25 / 0.75 / 1 give
--7.5 / -3.2 / +1.4 / +2.6 %). `--fixed-returns` runs the first model version, in
+-7.5 / -3.2 / +1.4 / +2.6 %). On weekends alpha = 0.75 fits best (57,320 vs
+57,248, +0.1 %; alpha 0 / 0.25 / 0.5 / 1 give -9.9 / -5.0 / -1.9 / +1.4 %). `--fixed-returns` runs the first model version, in
 which (3) uses the observed returns r and (4) is y_itk <= b_itk; served bikes then
 leave the model, so relocation helps much less (kept for comparison in the report).
 
@@ -278,10 +280,13 @@ python lp_model.py --baseline               # no relocation (x = 0) for comparis
 python lp_model.py --day-type weekend --p 20 --R 1.0 --M 2000
 python lp_model.py --input model_input_lp/disruption
 python lp_model.py --fixed-returns          # first model version, returns fixed
+# test the base-case weekday plan on the disruption days (x fixed, no new optimisation)
+python lp_model.py --input model_input_lp/disruption --plan reports/lp/weekday_p3.5_R1.5_alpha0.5/x.csv
+python plot_plan_map.py --run reports/lp/weekday_p3.5_R1.5_alpha0.5   # map of the plan -> net_flow_map.png
 ```
 
 All parameters are flags (`--day-type --p --h --v --Q --R --M --alpha --area --baseline
---fixed-returns --input`). All Paris on weekdays: ~717k variables, 30 s to 2.5 min.
+--fixed-returns --plan --input`). All Paris on weekdays: ~717k variables, 30 s to 2.5 min.
 The Gurobi log and the run time are printed; results go to
 `reports/lp/<run name>/` (`summary.json`, `x.csv` = night plan, `cells.csv` = per cell).
 

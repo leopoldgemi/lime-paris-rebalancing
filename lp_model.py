@@ -42,6 +42,8 @@ Usage
     python lp_model.py --day-type weekend --p 20 --R 1.0 --M 2000
     python lp_model.py --alpha 0.25               # less same-hour reuse of returned bikes
     python lp_model.py --fixed-returns            # first model version: returns r are fixed data
+    python lp_model.py --input model_input_lp/disruption \
+        --plan reports/lp/weekday_p3.5_R1.5_alpha0.5/x.csv   # test a fixed night plan on other days
 """
 
 import argparse
@@ -68,18 +70,29 @@ parser.add_argument("--R", type=float, default=1.5, help="max relocation distanc
 parser.add_argument("--M", type=float, default=None, help="max bikes relocated per night (default: no limit)")
 parser.add_argument("--area", type=int, default=None, help="only this arrondissement (1-20)")
 parser.add_argument("--baseline", action="store_true", help="no relocation: fix all x = 0")
-parser.add_argument("--alpha", type=float, default=0.5,
-                    help="share of the bikes returned in an hour that can be rented again in the same hour")
+parser.add_argument("--alpha", type=float, default=None,
+                    help="share of the bikes returned in an hour that can be rented again in the same hour "
+                         "(default: calibrated value, 0.5 weekday, 0.75 weekend)")
 parser.add_argument("--fixed-returns", action="store_true",
                     help="first model version: returns r are fixed data, constraints (3) and (4) without Y")
+parser.add_argument("--plan", default=None,
+                    help="x.csv of an earlier run: use this night plan instead of optimising x (a test, not an optimisation)")
 parser.add_argument("--out", default=None, help="output folder (default reports/lp/<run name>)")
 args = parser.parse_args()
 
 p, h, v, Q, R, M, alpha = args.p, args.h, args.v, args.Q, args.R, args.M, args.alpha
 
-run_name = f"{args.day_type}_p{p:g}_R{R:g}" + (f"_M{M:g}" if M else "") \
+# Calibrated alpha: with x = 0 the model then serves as many trips as were observed
+# (weekday 0.5: -0.4 %, weekend 0.75: +0.1 %).
+if alpha is None:
+    alpha = {"weekday": 0.5, "weekend": 0.75}[args.day_type]
+
+# Run name: data set (if not the base case), day type and the parameters that differ.
+dataset = Path(args.input).name
+run_name = ("" if dataset == "base" else dataset + "_") + f"{args.day_type}_p{p:g}_R{R:g}" + (f"_M{M:g}" if M else "") \
     + ("_fixed-returns" if args.fixed_returns else f"_alpha{alpha:g}") \
-    + (f"_area{args.area}" if args.area else "") + ("_baseline" if args.baseline else "")
+    + (f"_area{args.area}" if args.area else "") + ("_baseline" if args.baseline else "") \
+    + ("_plan-" + Path(args.plan).parent.name if args.plan else "")
 out = Path(args.out) if args.out else BASE_DIR / "reports" / "lp" / run_name
 out.mkdir(parents=True, exist_ok=True)
 input_dir = BASE_DIR / args.input
@@ -144,6 +157,24 @@ l = model.addVars(keys, lb=0, name="l")
 if args.baseline:
     for arc in A:
         x[arc].UB = 0
+
+# Fixed plan: x is set to the plan of an earlier run, nothing is optimised.
+# If a cell has fewer bikes at night than the plan wants to take away, all of its
+# moves are scaled down by the same factor, so that constraint (1) still holds.
+plan_dropped = 0.0
+if args.plan:
+    old_plan = pd.read_csv(args.plan)
+    old_plan = old_plan[old_plan["i"].isin(I) & old_plan["j"].isin(I)]
+    planned_sent = old_plan.groupby("i")["x"].sum()
+    factor = {i: min(1.0, s[i] / planned_sent[i]) for i in planned_sent.index}
+    for arc in A:
+        x[arc].UB = 0
+    for i, j, planned in zip(old_plan["i"], old_plan["j"], old_plan["x"]):
+        x[i, j].LB = planned * factor[i]
+        x[i, j].UB = planned * factor[i]
+        plan_dropped += planned * (1 - factor[i])
+    print(f"fixed plan from {args.plan}: {old_plan['x'].sum():,.0f} bikes planned, "
+          f"{plan_dropped:,.1f} dropped because the origin cell had fewer bikes")
 
 # Outgoing and incoming relocations of every cell, used in (1) and (2).
 out_arcs = {i: [] for i in I}
@@ -245,6 +276,7 @@ per_cell.to_csv(out / "cells.csv", index=False)
 
 summary = {
     "run": run_name, "day_type": args.day_type, "days": K, "area": args.area, "baseline": args.baseline,
+    "plan": args.plan, "plan_bikes_dropped": plan_dropped,
     "p": p, "h": h, "v": v, "Q": Q, "R": R, "M": M,
     "alpha": None if args.fixed_returns else alpha, "fixed_returns": args.fixed_returns,
     "cells": len(I), "arcs": len(A), "variables": model.NumVars, "constraints": model.NumConstrs,
