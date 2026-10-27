@@ -43,7 +43,8 @@ Reads
 Writes (into --out, default model_input_lp/, ignored by git)
 ------
     cells.csv          cell id, centre (km and lat/lon), arrondissement
-    days.csv           every operating day found, its type and whether it is complete
+    days.csv           every operating day found: type, complete or not, rentals,
+                       visible bikes (mean number of e-bikes in the feed) and rentals per bike
     s.csv              s[i] per day type
     hourly.csv.gz      r, rentals, d per day type, day, cell and hour
     arcs.csv.gz        all pairs (i, j), i != j, with dist[i,j] <= --R-max km
@@ -51,7 +52,8 @@ Writes (into --out, default model_input_lp/, ignored by git)
 
 Usage
 -----
-    python build_model_inputs.py --data-dir ../lime-data-backup/daily
+    python build_model_inputs.py --data-dir ../lime-data-backup/daily \
+        --first-day 2026-10-02 --last-day 2026-10-16 --out model_input_lp/base
 """
 
 import argparse
@@ -269,6 +271,9 @@ def main():
     p.add_argument("--data-dir", default="data", help="folder with lime_paris_YYYY-MM-DD.csv.gz")
     p.add_argument("--out", default="model_input_lp")
     p.add_argument("--R-max", type=float, default=3.0, help="keep pairs up to this distance in km")
+    p.add_argument("--first-day", default="2000-01-01", help="first operating day to use, YYYY-MM-DD")
+    p.add_argument("--last-day", default="2100-01-01", help="last operating day to use, YYYY-MM-DD")
+    p.add_argument("--exclude", default="", help="operating days to leave out, comma separated YYYY-MM-DD")
     a = p.parse_args()
 
     data_dir = Path(a.data_dir).expanduser()
@@ -291,7 +296,13 @@ def main():
     zoning = Zoning("grid", GRID_M)
     cache = {}
     days, s_rows, hourly = [], [], []
-    for date in pd.date_range(min(files), max(files)):
+    excluded = [d for d in a.exclude.split(",") if d]
+    first_day = max(min(files), a.first_day)
+    last_day = min(max(files), a.last_day)
+    for date in pd.date_range(first_day, last_day):
+        if date.strftime("%Y-%m-%d") in excluded:
+            days.append({"day": date.date(), "day_type": "", "complete": False, "reason": "excluded (--exclude)"})
+            continue
         day_type = "weekend" if date.dayofweek >= 5 else "weekday"
         start = pd.Timestamp(date.year, date.month, date.day, DAY_START[day_type], tz=PARIS_TZ)
         night = pd.Timestamp(date.year, date.month, date.day, NIGHT_HOUR[day_type], tz=PARIS_TZ)
@@ -313,8 +324,10 @@ def main():
             complete, reason = False, "hour with < 30 usable minutes"
         elif not complete:
             reason = "too few snapshots or gap"
+        # Visible bikes = mean number of e-bikes in the feed during the 18 hours.
+        visible = np.mean([len(rec["ids"]) for rec in recs if start <= rec["t"] < start + pd.Timedelta(hours=HOURS)])
         days.append({"day": date.date(), "day_type": day_type, "complete": complete, "reason": reason,
-                     "snapshots": n_snaps, "max_gap_min": max_gap,
+                     "snapshots": n_snaps, "max_gap_min": max_gap, "visible_bikes": visible,
                      "s_total": None if s is None else s.sum(), "rentals_obs": rentals.sum()})
         print(f"{date.date()} {day_type}: complete={complete} {reason} snapshots={n_snaps} "
               f"rentals={rentals.sum():,.0f}", flush=True)
@@ -335,7 +348,6 @@ def main():
             del cache[key]
 
     days = pd.DataFrame(days)
-    days.to_csv(out / "days.csv", index=False)
 
     # s[i]: mean night inventory over the days of each type.
     s_all = pd.concat(s_rows, ignore_index=True)
@@ -348,12 +360,23 @@ def main():
            "rentals", "r", "d", "case"]]
     h.to_csv(out / "hourly.csv.gz", index=False, float_format="%.4f")
 
+    # Rentals per day (scaled to the full 18 hours) and rentals per visible bike.
+    days["rentals"] = days["day"].map(h.groupby("day")["rentals"].sum())
+    days["rentals_per_bike"] = days["rentals"] / days["visible_bikes"]
+    days.to_csv(out / "days.csv", index=False)
+
     write_summary(out, cells, arcs, days, s_mean, s_all, h)
 
 
 def write_summary(out, cells, arcs, days, s_mean, s_all, h):
     lines = ["# Model inputs (build_model_inputs.py)", "",
-             f"- cells: {len(cells)} ({GRID_M} m, centre inside Paris intra-muros)", ""]
+             f"- cells: {len(cells)} ({GRID_M} m, centre inside Paris intra-muros)", "",
+             "| day | weekday | type | rentals (18 h) | visible bikes | rentals per bike |",
+             "|---|---|---|---|---|---|"]
+    for row in days[days["complete"]].itertuples():
+        lines.append(f"| {row.day} | {pd.Timestamp(row.day).day_name()[:3]} | {row.day_type} | {row.rentals:,.0f} | "
+                     f"{row.visible_bikes:,.0f} | {row.rentals_per_bike:.2f} |")
+    lines += [""]
     lines += ["| day type | complete days | sum(s) | rentals/day | corrected demand/day | correction | returns/day |",
               "|---|---|---|---|---|---|---|"]
     for day_type, g in h.groupby("day_type"):
