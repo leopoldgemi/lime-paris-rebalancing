@@ -38,6 +38,8 @@ recommendation to rotate ids for privacy. Consequences and the workaround are in
 | `.github/workflows/collect.yml` | manual single snapshot (the cron schedule never fired; superseded by the loop). |
 | `.github/workflows/daily-release.yml` | daily 03:40 UTC: merges yesterday's snapshots into `lime_paris_YYYY-MM-DD.csv.gz` on the release `daily-data`. |
 | `.github/workflows/keepalive.yml` | weekly: empty commit if `main` is older than 45 days (GitHub disables schedules after 60 idle days). |
+| `build_model_inputs.py` | LP inputs on a 300 m grid: night inventory s, returns r, empty-minute-corrected demand d per cell/hour/day, distances (see "Model"). |
+| `lp_model.py` | LP rebalancing model in gurobipy (see "Model"). |
 | `merge_day.py` | merges one day of per-snapshot files into a single daily csv.gz (stdlib). |
 | `deploy/` | systemd unit + setup script for a small Linux VM; bootstrap script for the `data` branch. |
 
@@ -202,6 +204,74 @@ snapshot density, so capacity − mean vehicles gives free parking per cell.
 Caveats: capacity is shared with private bikes and other operators (Vélib'
 stations are separate records, `regpar = "Vélib'"`); the city does not
 guarantee completeness.
+
+## Model
+
+The rebalancing model is a linear program solved with Gurobi. A van moves
+bikes between nearby 300 m cells at night (one plan, used every day); during
+the day riders take bikes where they are, and a trip is lost when the cell is
+empty. The LP chooses the night plan with the lowest cost of relocation plus
+lost trips.
+
+    min  sum_{(i,j) in A} c_ij x_ij + (1/|K|) sum_{i,t,k} p l_itk,   c_ij = h + v dist_ij / Q
+    (1) sum_j x_ij <= s_i                            supply at night
+    (2) b_i1k = s_i - sum_j x_ij + sum_j x_ji        inventory at the start of the day
+    (3) b_i,t+1,k = b_itk - y_itk + r_itk            hourly inventory balance
+    (4) y_itk <= b_itk                               serve only with bikes present
+    (5) y_itk + l_itk = d_itk                        every trip asked for is served or lost
+    (6) sum x_ij <= M                                optional limit per night
+
+| Symbol | Meaning | Default |
+|---|---|---|
+| i, j | 300 m cells with centre inside Paris (1 178) | |
+| t | hour of the operating day, 1..18 (weekday 07:00-01:00, weekend 09:00-03:00) | |
+| k | operating day of one type (weekday or weekend) | |
+| s_i | bikes in the cell at night (01:00 weekday, 03:00 weekend), mean over days | data |
+| r_itk | returns (trip ends) | data |
+| d_itk | demand = rentals corrected for minutes without any available bike | data |
+| A | pairs i != j with dist_ij <= R | R = 1.5 km |
+| p, h, v, Q, M | lost profit per trip, handling cost per bike, van cost per km, bikes per van, limit | 3.50, 0.67, 1.30, 15, off |
+
+### Setup (once)
+
+1. Python 3.10 or newer, then `pip install -r requirements.txt` (includes `gurobipy`).
+2. Gurobi needs a licence for models above 2 000 variables. The **Gurobi Academic
+   License is free** for students: register with the university e-mail at
+   <https://www.gurobi.com/academia/academic-program-and-licenses/>, create a
+   "WLS Academic" licence in the Gurobi portal and save the `gurobi.lic` file it
+   gives you in your home folder (`~/gurobi.lic`).
+3. Check: `python -c "import gurobipy; gurobipy.Model()"` must print
+   "Academic license ...", not "Restricted license".
+4. Snapshot data: download the daily files from the `daily-data` release, e.g.
+   `gh release download daily-data -R leopoldgemi/lime-paris-rebalancing -D ../lime-data/daily`.
+
+### Step 1: model inputs (`build_model_inputs.py`, ~10 s per day)
+
+```bash
+# base case: 02.-16.10., without 06.10. (demonstration day, +18 % rentals)
+python build_model_inputs.py --data-dir ../lime-data/daily \
+    --first-day 2026-10-02 --last-day 2026-10-16 --exclude 2026-10-06 --out model_input_lp/base
+# what-if data set "disruption": 17.-26.10. (unrest, curfew, storms)
+python build_model_inputs.py --data-dir ../lime-data/daily \
+    --first-day 2026-10-17 --last-day 2026-10-26 --out model_input_lp/disruption
+```
+
+Writes `cells.csv`, `days.csv`, `s.csv`, `hourly.csv.gz` (r and d), `arcs.csv.gz`
+(distances) and `summary.md` into the `--out` folder (`model_input_lp/` is not in git).
+
+### Step 2: solve (`lp_model.py`)
+
+```bash
+python lp_model.py --area 18               # small test: 18th arrondissement only
+python lp_model.py                          # all Paris, weekdays, base case
+python lp_model.py --baseline               # no relocation (x = 0) for comparison
+python lp_model.py --day-type weekend --p 20 --R 1.0 --M 2000
+python lp_model.py --input model_input_lp/disruption
+```
+
+All parameters are flags (`--day-type --p --h --v --Q --R --M --area --baseline --input`).
+The Gurobi log and the run time are printed; results go to
+`reports/lp/<run name>/` (`summary.json`, `x.csv` = night plan, `cells.csv` = per cell).
 
 ## Politeness
 

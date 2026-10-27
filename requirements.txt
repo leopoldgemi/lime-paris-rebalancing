@@ -1,6 +1,8 @@
-# collector needs only requests; analysis needs pandas (+ matplotlib for plots, shapely + scipy for build_demand.py)
+# collector needs only requests; analysis needs pandas (+ matplotlib for plots, shapely + scipy for build_demand.py);
+# lp_model.py needs gurobipy (free Gurobi Academic License, see README "Model")
 requests>=2.28
 pandas>=2.0
 matplotlib>=3.7
 shapely>=2.0
 scipy>=1.10
+gurobipy>=12.0
