@@ -210,14 +210,16 @@ guarantee completeness.
 The rebalancing model is a linear program solved with Gurobi. A van moves
 bikes between nearby 300 m cells at night (one plan, used every day); during
 the day riders take bikes where they are, and a trip is lost when the cell is
-empty. The LP chooses the night plan with the lowest cost of relocation plus
-lost trips.
+empty. Every served trip brings its bike back in the same hour, spread over
+the cells like the observed returns of that hour, so the fleet stays constant.
+The LP chooses the night plan with the lowest cost of relocation plus lost trips.
 
     min  sum_{(i,j) in A} c_ij x_ij + (1/|K|) sum_{i,t,k} p l_itk,   c_ij = h + v dist_ij / Q
     (1) sum_j x_ij <= s_i                            supply at night
     (2) b_i1k = s_i - sum_j x_ij + sum_j x_ji        inventory at the start of the day
-    (3) b_i,t+1,k = b_itk - y_itk + r_itk            hourly inventory balance
-    (4) y_itk <= b_itk                               serve only with bikes present
+    (Y) Y_tk = sum_i y_itk                           all trips served in hour t
+    (3) b_j,t+1,k = b_jtk - y_jtk + pi_jtk Y_tk      hourly balance, returns follow served trips
+    (4) y_itk <= b_itk + alpha pi_itk Y_tk           bikes present + same-hour reuse of returns
     (5) y_itk + l_itk = d_itk                        every trip asked for is served or lost
     (6) sum x_ij <= M                                optional limit per night
 
@@ -228,9 +230,17 @@ lost trips.
 | k | operating day of one type (weekday or weekend) | |
 | s_i | bikes in the cell at night (01:00 weekday, 03:00 weekend), mean over days | data |
 | r_itk | returns (trip ends) | data |
+| pi_jtk | r_jtk / sum_j r_jtk: share of the returns of hour t, day k that end in cell j | data |
+| alpha | share of the bikes returned in an hour that can be rented again in the same hour | 0.5 |
 | d_itk | demand = rentals corrected for minutes without any available bike | data |
 | A | pairs i != j with dist_ij <= R | R = 1.5 km |
 | p, h, v, Q, M | lost profit per trip, handling cost per bike, van cost per km, bikes per van, limit | 3.50, 0.67, 1.30, 15, off |
+
+alpha = 0.5 is calibrated: with x = 0 the model then serves 56,263 trips per
+weekday against 56,464 observed rentals (-0.4 %; alpha 0 / 0.25 / 0.75 / 1 give
+-7.5 / -3.2 / +1.4 / +2.6 %). `--fixed-returns` runs the first model version, in
+which (3) uses the observed returns r and (4) is y_itk <= b_itk; served bikes then
+leave the model, so relocation helps much less (kept for comparison in the report).
 
 ### Setup (once)
 
@@ -267,9 +277,11 @@ python lp_model.py                          # all Paris, weekdays, base case
 python lp_model.py --baseline               # no relocation (x = 0) for comparison
 python lp_model.py --day-type weekend --p 20 --R 1.0 --M 2000
 python lp_model.py --input model_input_lp/disruption
+python lp_model.py --fixed-returns          # first model version, returns fixed
 ```
 
-All parameters are flags (`--day-type --p --h --v --Q --R --M --area --baseline --input`).
+All parameters are flags (`--day-type --p --h --v --Q --R --M --alpha --area --baseline
+--fixed-returns --input`). All Paris on weekdays: ~717k variables, 30 s to 2.5 min.
 The Gurobi log and the run time are printed; results go to
 `reports/lp/<run name>/` (`summary.json`, `x.csv` = night plan, `cells.csv` = per cell).
 
