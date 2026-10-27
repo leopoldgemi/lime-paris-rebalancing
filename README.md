@@ -218,11 +218,12 @@ The LP chooses the night plan with the lowest cost of relocation plus lost trips
     min  sum_{(i,j) in A} c_ij x_ij + (1/|K|) sum_{i,t,k} p l_itk,   c_ij = h + v dist_ij / Q
     (1) sum_j x_ij <= s_i                            supply at night
     (2) b_i1k = s_i - sum_j x_ij + sum_j x_ji        inventory at the start of the day
-    (Y) Y_tk = sum_i y_itk                           all trips served in hour t
-    (3) b_j,t+1,k = b_jtk - y_jtk + pi_jtk Y_tk      hourly balance, returns follow served trips
-    (4) y_itk <= b_itk + alpha pi_itk Y_tk           bikes present + same-hour reuse of returns
-    (5) y_itk + l_itk = d_itk                        every trip asked for is served or lost
-    (6) sum x_ij <= M                                optional limit per night
+    (3) Y_tk = sum_i y_itk                           all trips served in hour t
+    (4) b_j,t+1,k = b_jtk - y_jtk + pi_jtk Y_tk      hourly balance, returns follow served trips
+    (5) y_itk <= b_itk + alpha pi_itk Y_tk           bikes present + same-hour reuse of returns
+    (6) y_itk + l_itk = d_itk                        every trip asked for is served or lost
+    (7) sum x_ij <= M                                optional limit per night
+    (8) x, b, y, l, Y >= 0                           non-negativity
 
 | Symbol | Meaning | Default |
 |---|---|---|
@@ -241,7 +242,7 @@ alpha = 0.5 is calibrated: with x = 0 the model then serves 56,263 trips per
 weekday against 56,464 observed rentals (-0.4 %; alpha 0 / 0.25 / 0.75 / 1 give
 -7.5 / -3.2 / +1.4 / +2.6 %). On weekends alpha = 0.75 fits best (57,320 vs
 57,248, +0.1 %; alpha 0 / 0.25 / 0.5 / 1 give -9.9 / -5.0 / -1.9 / +1.4 %). `--fixed-returns` runs the first model version, in
-which (3) uses the observed returns r and (4) is y_itk <= b_itk; served bikes then
+which (4) uses the observed returns r instead of pi_jtk Y_tk and (5) is y_itk <= b_itk; served bikes then
 leave the model, so relocation helps much less (kept for comparison in the report).
 
 ### Setup (once)
