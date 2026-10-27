@@ -57,6 +57,122 @@ from gurobipy import GRB
 
 BASE_DIR = Path(__file__).resolve().parent
 
+
+# ---- Helper functions -------------------------------------------------------
+
+
+def fix_plan(x, A, I, s, plan_path):
+    """Set x to the night plan of an earlier run instead of optimising it.
+
+    If a cell has fewer bikes at night than the plan wants to take away, all of
+    its moves are scaled down by the same factor, so that constraint (1) still
+    holds. Returns the number of planned bikes that could not be moved.
+    """
+    old_plan = pd.read_csv(plan_path)
+    old_plan = old_plan[old_plan["i"].isin(I) & old_plan["j"].isin(I)]
+    planned_sent = old_plan.groupby("i")["x"].sum()
+    factor = {i: min(1.0, s[i] / planned_sent[i]) for i in planned_sent.index}
+
+    # First no move at all, then exactly the (scaled) planned moves.
+    for arc in A:
+        x[arc].UB = 0
+    dropped = 0.0
+    for i, j, planned in zip(old_plan["i"], old_plan["j"], old_plan["x"]):
+        x[i, j].LB = planned * factor[i]
+        x[i, j].UB = planned * factor[i]
+        dropped += planned * (1 - factor[i])
+    print(f"fixed plan from {plan_path}: {old_plan['x'].sum():,.0f} bikes planned, "
+          f"{dropped:,.1f} dropped because the origin cell had fewer bikes")
+    return dropped
+
+
+def write_results(out, run_name, args, model, cells, s, d, keys, A, dist, x, b, y, l, seconds, plan_dropped):
+    """Save the night plan, per-cell results and key numbers, and print them.
+
+    out, run_name, args   where to write and which run this is
+    model                 the solved Gurobi model
+    cells, s, d, keys     input data (cells table, night bikes, demand, all (i, t, k))
+    A, dist               allowed pairs and their distance
+    x, b, y, l            the model variables
+    seconds               (build time, solve time)
+    plan_dropped          bikes of a fixed plan that could not be moved (0 if no --plan)
+    """
+    I = list(cells["cell"])
+    K = sorted({k for (i, t, k) in keys})
+    T = sorted({t for (i, t, k) in keys})
+
+    # Night plan: all pairs with x > 0.
+    plan = pd.DataFrame([(i, j, dist[i, j], x[i, j].X) for (i, j) in A if x[i, j].X > 1e-6],
+                        columns=["i", "j", "dist", "x"])
+    plan.to_csv(out / "x.csv", index=False)
+    moved = plan["x"].sum()
+    mean_dist = (plan["x"] * plan["dist"]).sum() / moved if moved > 0 else 0.0
+
+    # Trips per day, and the two parts of the cost.
+    demand_per_day = sum(d.values()) / len(K)
+    lost_per_day = sum(l[key].X for key in keys) / len(K)
+    served_per_day = sum(y[key].X for key in keys) / len(K)
+    lost_cost = args.p * lost_per_day
+    relocation_cost = model.ObjVal - lost_cost
+
+    # Fleet check: bikes in the city at the start of every hour (should equal sum(s)
+    # for every t with endogenous returns; with --fixed-returns it drifts).
+    fleet = pd.Series({(t, k): sum(b[i, t, k].X for i in I) for t in T for k in K})
+    fleet_deviation = float((fleet - sum(s.values())).abs().max())
+
+    # Per cell: bikes sent away, received, net inflow and lost trips per day.
+    sent = {i: 0.0 for i in I}
+    received = {i: 0.0 for i in I}
+    for (i, j) in A:
+        sent[i] += x[i, j].X
+        received[j] += x[i, j].X
+    lost_by_cell = {i: 0.0 for i in I}
+    for (i, t, k) in keys:
+        lost_by_cell[i] += l[i, t, k].X / len(K)
+    per_cell = pd.DataFrame({"cell": I, "arrondissement": list(cells["arrondissement"]),
+                             "s": [s[i] for i in I],
+                             "sent": [sent[i] for i in I],
+                             "received": [received[i] for i in I]})
+    per_cell["net_inflow"] = per_cell["received"] - per_cell["sent"]
+    per_cell["lost_per_day"] = [lost_by_cell[i] for i in I]
+    per_cell.to_csv(out / "cells.csv", index=False)
+
+    summary = {
+        "run": run_name, "day_type": args.day_type, "days": K, "area": args.area, "baseline": args.baseline,
+        "plan": args.plan, "plan_bikes_dropped": plan_dropped,
+        "p": args.p, "h": args.h, "v": args.v, "Q": args.Q, "R": args.R, "M": args.M,
+        "alpha": None if args.fixed_returns else args.alpha, "fixed_returns": args.fixed_returns,
+        "cells": len(I), "arcs": len(A), "variables": model.NumVars, "constraints": model.NumConstrs,
+        "build_seconds": round(seconds[0], 1), "solve_seconds": round(seconds[1], 1),
+        "objective": model.ObjVal,
+        "relocation_cost": relocation_cost, "lost_cost_per_day": lost_cost,
+        "demand_per_day": demand_per_day, "served_per_day": served_per_day, "lost_per_day": lost_per_day,
+        "lost_share": lost_per_day / demand_per_day,
+        "bikes_moved": moved, "mean_distance_km": mean_dist,
+        # Sanity check: no cell gives away more than it has (constraint (1)).
+        "max_sent_minus_s": float((per_cell["sent"] - per_cell["s"]).max()),
+        # Fleet check: largest gap between bikes in the city and sum(s), over all hours and days.
+        "fleet_deviation": fleet_deviation,
+    }
+    (out / "summary.json").write_text(json.dumps(summary, indent=2))
+
+    print(f"\n=== {run_name} ===")
+    print(f"solve time {summary['solve_seconds']} s, objective {model.ObjVal:,.2f} EUR per day")
+    print(f"lost trips per day   {lost_per_day:,.0f} of {demand_per_day:,.0f} ({summary['lost_share']:.1%})")
+    print(f"bikes relocated      {moved:,.0f}, mean distance {mean_dist:.2f} km")
+    print(f"relocation cost      {relocation_cost:,.2f} EUR")
+    print(f"lost trips cost/day  {lost_cost:,.2f} EUR")
+    print(f"served trips per day {served_per_day:,.0f}")
+    print(f"max (sent - s)       {summary['max_sent_minus_s']:.6f}  (must be <= 0)")
+    print(f"fleet deviation      {fleet_deviation:.6f} bikes  (max |sum_i b[i,t,k] - sum(s)|, 0 with endogenous returns)")
+    if moved > 0:
+        print("\nTop 10 net inflow (receive bikes):")
+        print(per_cell.nlargest(10, "net_inflow").round(1).to_string(index=False))
+        print("\nTop 10 net outflow (give bikes):")
+        print(per_cell.nsmallest(10, "net_inflow").round(1).to_string(index=False))
+    print(f"\nresults in {out}")
+
+
 # ---- Parameters -------------------------------------------------------------
 
 parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -74,25 +190,38 @@ parser.add_argument("--alpha", type=float, default=None,
                     help="share of the bikes returned in an hour that can be rented again in the same hour "
                          "(default: calibrated value, 0.5 weekday, 0.75 weekend)")
 parser.add_argument("--fixed-returns", action="store_true",
-                    help="first model version: returns r are fixed data, constraints (3) and (4) without Y")
+                    help="first model version: returns r are fixed data, constraints (4) and (5) without Y")
 parser.add_argument("--plan", default=None,
                     help="x.csv of an earlier run: use this night plan instead of optimising x (a test, not an optimisation)")
 parser.add_argument("--out", default=None, help="output folder (default reports/lp/<run name>)")
 args = parser.parse_args()
 
+# Calibrated alpha: with x = 0 the model then serves as many trips as were observed
+# (weekday 0.5: -0.4 %, weekend 0.75: +0.1 %). The value used is stored in args.
+if args.alpha is None:
+    args.alpha = {"weekday": 0.5, "weekend": 0.75}[args.day_type]
+
 p, h, v, Q, R, M, alpha = args.p, args.h, args.v, args.Q, args.R, args.M, args.alpha
 
-# Calibrated alpha: with x = 0 the model then serves as many trips as were observed
-# (weekday 0.5: -0.4 %, weekend 0.75: +0.1 %).
-if alpha is None:
-    alpha = {"weekday": 0.5, "weekend": 0.75}[args.day_type]
-
-# Run name: data set (if not the base case), day type and the parameters that differ.
+# Run name: one part per setting, so that every run gets its own folder.
 dataset = Path(args.input).name
-run_name = ("" if dataset == "base" else dataset + "_") + f"{args.day_type}_p{p:g}_R{R:g}" + (f"_M{M:g}" if M else "") \
-    + ("_fixed-returns" if args.fixed_returns else f"_alpha{alpha:g}") \
-    + (f"_area{args.area}" if args.area else "") + ("_baseline" if args.baseline else "") \
-    + ("_plan-" + Path(args.plan).parent.name if args.plan else "")
+run_name = ""
+if dataset != "base":
+    run_name += dataset + "_"                             # data set, e.g. disruption_
+run_name += f"{args.day_type}_p{p:g}_R{R:g}"             # day type, lost profit p, radius R
+if M:
+    run_name += f"_M{M:g}"                                # limit on relocated bikes
+if args.fixed_returns:
+    run_name += "_fixed-returns"                          # first model version
+else:
+    run_name += f"_alpha{alpha:g}"                        # same-hour reuse share
+if args.area:
+    run_name += f"_area{args.area}"                       # one arrondissement only
+if args.baseline:
+    run_name += "_baseline"                               # x = 0
+if args.plan:
+    run_name += "_plan-" + Path(args.plan).parent.name    # fixed plan of another run
+
 out = Path(args.out) if args.out else BASE_DIR / "reports" / "lp" / run_name
 out.mkdir(parents=True, exist_ok=True)
 input_dir = BASE_DIR / args.input
@@ -106,7 +235,6 @@ cells = pd.read_csv(input_dir / "cells.csv")
 if args.area:
     cells = cells[cells["arrondissement"] == args.area]
 I = list(cells["cell"])
-arrondissement = dict(zip(cells["cell"], cells["arrondissement"]))
 
 # s[i]: bikes in cell i at night (mean over the days of this type).
 s_table = pd.read_csv(input_dir / "s.csv")
@@ -142,15 +270,16 @@ print(f"sum(s) = {sum(s.values()):,.0f}, demand per day = {sum(d.values()) / len
 model = gp.Model("lime_rebalancing")
 
 # Variable x[i,j]: bikes moved at night from cell i to cell j (same plan every day).
+# Constraint (8): non-negativity (lb=0), here and for all other variables.
 x = model.addVars(A, lb=0, name="x")
 
-# Variable b[i,t,k]: bikes in cell i at the start of hour t on day k.
+# Variable b[i,t,k]: bikes in cell i at the start of hour t on day k. (8): b >= 0.
 b = model.addVars(keys, lb=0, name="b")
 
-# Variable y[i,t,k]: trips served in cell i in hour t on day k.
+# Variable y[i,t,k]: trips served in cell i in hour t on day k. (8): y >= 0.
 y = model.addVars(keys, lb=0, name="y")
 
-# Variable l[i,t,k]: trips lost in cell i in hour t on day k (rider found no bike).
+# Variable l[i,t,k]: trips lost in cell i in hour t on day k (rider found no bike). (8): l >= 0.
 l = model.addVars(keys, lb=0, name="l")
 
 # Baseline: no relocation at all.
@@ -158,23 +287,10 @@ if args.baseline:
     for arc in A:
         x[arc].UB = 0
 
-# Fixed plan: x is set to the plan of an earlier run, nothing is optimised.
-# If a cell has fewer bikes at night than the plan wants to take away, all of its
-# moves are scaled down by the same factor, so that constraint (1) still holds.
+# Fixed plan from an earlier run (a test, nothing is optimised in x).
 plan_dropped = 0.0
 if args.plan:
-    old_plan = pd.read_csv(args.plan)
-    old_plan = old_plan[old_plan["i"].isin(I) & old_plan["j"].isin(I)]
-    planned_sent = old_plan.groupby("i")["x"].sum()
-    factor = {i: min(1.0, s[i] / planned_sent[i]) for i in planned_sent.index}
-    for arc in A:
-        x[arc].UB = 0
-    for i, j, planned in zip(old_plan["i"], old_plan["j"], old_plan["x"]):
-        x[i, j].LB = planned * factor[i]
-        x[i, j].UB = planned * factor[i]
-        plan_dropped += planned * (1 - factor[i])
-    print(f"fixed plan from {args.plan}: {old_plan['x'].sum():,.0f} bikes planned, "
-          f"{plan_dropped:,.1f} dropped because the origin cell had fewer bikes")
+    plan_dropped = fix_plan(x, A, I, s, args.plan)
 
 # Outgoing and incoming relocations of every cell, used in (1) and (2).
 out_arcs = {i: [] for i in I}
@@ -199,38 +315,38 @@ model.addConstrs((sent[i] <= s[i] for i in I), name="supply")
 model.addConstrs((b[i, 1, k] == s[i] - sent[i] + received[i] for i in I for k in K), name="start")
 
 if args.fixed_returns:
-    # Constraint (3), first version: hourly inventory balance with the observed returns.
+    # Constraint (4), first version: hourly inventory balance with the observed returns.
     # Bikes next hour = bikes now - trips served + bikes returned (data r).
     model.addConstrs((b[i, t + 1, k] == b[i, t, k] - y[i, t, k] + r[i, t, k]
                       for (i, t, k) in keys if t < len(T)), name="balance")
 
-    # Constraint (4), first version: a cell can only serve trips with the bikes it has.
+    # Constraint (5), first version: a cell can only serve trips with the bikes it has.
     model.addConstrs((y[key] <= b[key] for key in keys), name="serve")
 else:
-    # Variable Y[t,k]: all trips served in the city in hour t on day k.
+    # Variable Y[t,k]: all trips served in the city in hour t on day k. (8): Y >= 0.
     Y = model.addVars(T, K, lb=0, name="Y")
 
-    # Constraint (Y): Y is the sum of the served trips over all cells.
+    # Constraint (3): Y is the sum of the served trips over all cells.
     model.addConstrs((Y[t, k] == gp.quicksum(y[i, t, k] for i in I) for t in T for k in K),
                      name="total_served")
 
-    # Constraint (3): hourly inventory balance with returns that follow the served trips.
+    # Constraint (4): hourly inventory balance with returns that follow the served trips.
     # Every served bike comes back in the same hour, spread over the cells like the
     # observed returns of that hour (share pi). So the fleet stays exactly constant.
     # Bikes next hour = bikes now - trips served + this cell's share of all served trips.
     model.addConstrs((b[j, t + 1, k] == b[j, t, k] - y[j, t, k] + pi[j, t, k] * Y[t, k]
                       for (j, t, k) in keys if t < len(T)), name="balance")
 
-    # Constraint (4): same-hour reuse.
+    # Constraint (5): same-hour reuse.
     # A cell can serve the bikes it has at the start of the hour plus a share alpha
     # of the bikes returned to it during the hour (they can be rented again at once).
     model.addConstrs((y[i, t, k] <= b[i, t, k] + alpha * pi[i, t, k] * Y[t, k]
                       for (i, t, k) in keys), name="serve")
 
-# Constraint (5): every trip asked for is either served or lost.
+# Constraint (6): every trip asked for is either served or lost.
 model.addConstrs((y[key] + l[key] == d[key] for key in keys), name="demand")
 
-# Constraint (6), optional: at most M bikes relocated per night.
+# Constraint (7), optional: at most M bikes relocated per night.
 if M is not None:
     model.addConstr(x.sum() <= M, name="max_relocation")
 
@@ -248,63 +364,5 @@ if model.Status != GRB.OPTIMAL:
 
 # ---- Results ----------------------------------------------------------------
 
-plan = pd.DataFrame([(i, j, dist[i, j], x[i, j].X) for (i, j) in A if x[i, j].X > 1e-6],
-                    columns=["i", "j", "dist", "x"])
-plan.to_csv(out / "x.csv", index=False)
-
-lost_per_day = sum(l[key].X for key in keys) / len(K)
-served_per_day = sum(y[key].X for key in keys) / len(K)
-
-# Fleet check: bikes in the city at the start of every hour (should equal sum(s)
-# for every t with endogenous returns; with --fixed-returns it drifts).
-fleet = pd.Series({(t, k): sum(b[i, t, k].X for i in I) for t in T for k in K})
-fleet_deviation = float((fleet - sum(s.values())).abs().max())
-demand_per_day = sum(d.values()) / len(K)
-moved = plan["x"].sum()
-mean_dist = (plan["x"] * plan["dist"]).sum() / moved if moved > 0 else 0.0
-
-per_cell = pd.DataFrame({"cell": I, "arrondissement": [arrondissement[i] for i in I],
-                         "s": [s[i] for i in I],
-                         "sent": [sent[i].getValue() for i in I],
-                         "received": [received[i].getValue() for i in I]})
-per_cell["net_inflow"] = per_cell["received"] - per_cell["sent"]
-lost_by_cell = pd.Series({i: 0.0 for i in I})
-for (i, t, k) in keys:
-    lost_by_cell[i] += l[i, t, k].X / len(K)
-per_cell["lost_per_day"] = per_cell["cell"].map(lost_by_cell)
-per_cell.to_csv(out / "cells.csv", index=False)
-
-summary = {
-    "run": run_name, "day_type": args.day_type, "days": K, "area": args.area, "baseline": args.baseline,
-    "plan": args.plan, "plan_bikes_dropped": plan_dropped,
-    "p": p, "h": h, "v": v, "Q": Q, "R": R, "M": M,
-    "alpha": None if args.fixed_returns else alpha, "fixed_returns": args.fixed_returns,
-    "cells": len(I), "arcs": len(A), "variables": model.NumVars, "constraints": model.NumConstrs,
-    "build_seconds": round(t_built - t_start, 1), "solve_seconds": round(t_solved - t_built, 1),
-    "objective": model.ObjVal,
-    "relocation_cost": relocation_cost.getValue(), "lost_cost_per_day": lost_cost.getValue(),
-    "demand_per_day": demand_per_day, "served_per_day": served_per_day, "lost_per_day": lost_per_day,
-    "lost_share": lost_per_day / demand_per_day,
-    "bikes_moved": moved, "mean_distance_km": mean_dist,
-    # Sanity check: no cell gives away more than it has (constraint (1)).
-    "max_sent_minus_s": float((per_cell["sent"] - per_cell["s"]).max()),
-    # Fleet check: largest gap between bikes in the city and sum(s), over all hours and days.
-    "fleet_deviation": fleet_deviation,
-}
-(out / "summary.json").write_text(json.dumps(summary, indent=2))
-
-print(f"\n=== {run_name} ===")
-print(f"solve time {summary['solve_seconds']} s, objective {model.ObjVal:,.2f} EUR per day")
-print(f"lost trips per day   {lost_per_day:,.0f} of {demand_per_day:,.0f} ({summary['lost_share']:.1%})")
-print(f"bikes relocated      {moved:,.0f}, mean distance {mean_dist:.2f} km")
-print(f"relocation cost      {summary['relocation_cost']:,.2f} EUR")
-print(f"lost trips cost/day  {summary['lost_cost_per_day']:,.2f} EUR")
-print(f"served trips per day {served_per_day:,.0f}")
-print(f"max (sent - s)       {summary['max_sent_minus_s']:.6f}  (must be <= 0)")
-print(f"fleet deviation      {fleet_deviation:.6f} bikes  (max |sum_i b[i,t,k] - sum(s)|, 0 with endogenous returns)")
-if moved > 0:
-    print("\nTop 10 net inflow (receive bikes):")
-    print(per_cell.nlargest(10, "net_inflow").round(1).to_string(index=False))
-    print("\nTop 10 net outflow (give bikes):")
-    print(per_cell.nsmallest(10, "net_inflow").round(1).to_string(index=False))
-print(f"\nresults in {out}")
+write_results(out, run_name, args, model, cells, s, d, keys, A, dist, x, b, y, l,
+              (t_built - t_start, t_solved - t_built), plan_dropped)
