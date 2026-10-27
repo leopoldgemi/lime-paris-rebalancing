@@ -274,21 +274,79 @@ Writes `cells.csv`, `days.csv`, `s.csv`, `hourly.csv.gz` (r and d), `arcs.csv.gz
 ### Step 2: solve (`lp_model.py`)
 
 ```bash
-python lp_model.py --area 18               # small test: 18th arrondissement only
+python lp_model.py --area 18               # quick test: 18th arrondissement only, < 1 s
 python lp_model.py                          # all Paris, weekdays, base case
-python lp_model.py --baseline               # no relocation (x = 0) for comparison
-python lp_model.py --day-type weekend --p 20 --R 1.0 --M 2000
-python lp_model.py --input model_input_lp/disruption
-python lp_model.py --fixed-returns          # first model version, returns fixed
-# test the base-case weekday plan on the disruption days (x fixed, no new optimisation)
-python lp_model.py --input model_input_lp/disruption --plan reports/lp/weekday_p3.5_R1.5_alpha0.5/x.csv
-python plot_plan_map.py --run reports/lp/weekday_p3.5_R1.5_alpha0.5   # map of the plan -> net_flow_map.png
 ```
 
 All parameters are flags (`--day-type --p --h --v --Q --R --M --alpha --area --baseline
---fixed-returns --plan --input`). All Paris on weekdays: ~717k variables, 30 s to 2.5 min.
-The Gurobi log and the run time are printed; results go to
+--fixed-returns --plan --input`). All Paris on weekdays: ~717k variables, 30 s to 2.5 min
+on a laptop. The Gurobi log, run time and key numbers are printed; results go to
 `reports/lp/<run name>/` (`summary.json`, `x.csv` = night plan, `cells.csv` = per cell).
+The run name holds the data set (if not `base`), day type, p, R, alpha and flags,
+e.g. `reports/lp/disruption_weekday_p3.5_R1.5_alpha0.5_baseline/`.
+
+### Step 3: reproduce the D2 results
+
+Run Step 1 first (both data sets). Each block below gives one table of the report;
+the expected numbers follow. Lost trips per day, bikes moved etc. are printed at the
+end of each run and stored in `summary.json`.
+
+```bash
+# (a) alpha calibration: baseline (x = 0) for 5 values of alpha, weekdays and weekends.
+#     Compare "served trips per day" with the observed rentals/day in
+#     model_input_lp/base/summary.md (weekday 56,464, weekend 57,248).
+for a in 0 0.25 0.5 0.75 1; do python lp_model.py --baseline --alpha $a; done
+for a in 0 0.25 0.5 0.75 1; do python lp_model.py --day-type weekend --baseline --alpha $a; done
+
+# (b) baseline and optimum, weekdays (alpha 0.5 by default), lost-profit variants
+python lp_model.py --baseline
+for p in 3.5 0.1 7 20; do python lp_model.py --p $p; done
+
+# (c) weekends (alpha 0.75 by default): baseline and optimum
+python lp_model.py --day-type weekend --baseline
+python lp_model.py --day-type weekend
+
+# (d) radius test, weekdays, p = 3.50
+for R in 1.0 1.5 2.0 3.0; do python lp_model.py --R $R; done
+
+# (e) stress test: base-case weekday plan (x fixed) on the 6 disruption weekdays,
+#     compared with no relocation on the same days
+python lp_model.py --input model_input_lp/disruption --baseline
+python lp_model.py --input model_input_lp/disruption --plan reports/lp/weekday_p3.5_R1.5_alpha0.5/x.csv
+
+# (f) first model version (returns fixed) for comparison
+python lp_model.py --fixed-returns --baseline
+python lp_model.py --fixed-returns
+
+# (g) map of the base-case weekday plan -> reports/lp/weekday_p3.5_R1.5_alpha0.5/net_flow_map.png
+python plot_plan_map.py --run reports/lp/weekday_p3.5_R1.5_alpha0.5
+```
+
+"Avoided per bike" in the report = (lost trips of the baseline - lost trips of the
+run) / bikes moved, both from `summary.json`.
+
+Expected results (Gurobi 13.0.3; another version can return a different night plan
+with the same cost, so bikes moved and distances may differ slightly, lost trips
+and costs should not):
+
+| Run | Lost trips/day | Bikes moved | Mean dist. | Cost/day (EUR) |
+|---|---|---|---|---|
+| (b) weekday baseline | 12,082 | 0 | - | 42,289 |
+| (b) weekday p = 3.50 | 10,024 | 2,090 | 1.12 km | 36,685 |
+| (b) weekday p = 0.10 | 12,082 | 0 | - | 1,208 |
+| (b) weekday p = 7 | 9,947 | 2,555 | 1.19 km | 71,607 |
+| (b) weekday p = 20 | 9,908 | 3,103 | 1.24 km | 200,576 |
+| (c) weekend baseline | 11,427 | 0 | - | 39,996 |
+| (c) weekend p = 3.50 | 8,854 | 2,458 | 0.95 km | 32,840 |
+| (d) R = 1.0 / 1.5 / 2.0 / 3.0 km | 10,165 / 10,024 / 9,979 / 9,938 | 2,222 / 2,090 / 2,014 / 2,014 | 0.79 / 1.12 / 1.35 / 1.65 km | 37,220 / 36,685 / 36,514 / 36,421 |
+| (e) disruption baseline | 9,953 | 0 | - | 34,835 |
+| (e) disruption with base plan | 9,367 | 1,860 | 1.12 km | 34,211 |
+| (f) fixed returns, baseline / optimum | 14,850 / 14,445 | 0 / 774 | - / 0.61 km | 51,975 / 51,116 |
+
+(a) served trips per day for alpha 0 / 0.25 / 0.5 / 0.75 / 1: weekdays 52,218 /
+54,657 / 56,263 / 57,255 / 57,907, weekends 51,554 / 54,372 / 56,182 / 57,320 / 58,034.
+In (e), 230 of the 2,090 planned bikes are not moved because their origin cell has
+fewer bikes at night on the disruption days (the run prints this).
 
 ## Politeness
 

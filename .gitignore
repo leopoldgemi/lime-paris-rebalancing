@@ -8,3 +8,5 @@ __pycache__/
 .DS_Store
 # LP model inputs (build_model_inputs.py), large
 model_input_lp/
+# old build_demand.py / coverage_curves.py outputs, kept locally only (regenerable)
+archive/old_model_input/
