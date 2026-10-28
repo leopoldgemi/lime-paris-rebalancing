@@ -111,7 +111,7 @@ python analyze_snapshots.py                              # reads data/lime_paris
 Raw per-snapshot files (including today's, not yet merged):
 
 ```bash
-git clone -b data --single-branch https://github.com/leopoldgemi/lime-paris-rebalancing lime-data
+git clone -b data --single-branch https://github.com/leopoldvscholz-star/lime-paris-rebalancing lime-data
 python analyze_snapshots.py --data-dir ../lime-data/data
 ```
 
@@ -124,7 +124,7 @@ reports the real median/max gap between snapshots.
 
 ```bash
 # on a fresh Ubuntu 24.04 VM, as root
-REPO=leopoldgemi/lime-paris-rebalancing bash deploy/setup_vm.sh
+REPO=leopoldvscholz-star/lime-paris-rebalancing bash deploy/setup_vm.sh
 journalctl -u lime-collector -f
 # fetch data to your laptop
 rsync -avz lime@<vm-ip>:lime-paris-rebalancing/data/ ./data/
@@ -256,7 +256,7 @@ leave the model, so relocation helps much less (kept for comparison in the repor
 3. Check: `python -c "import gurobipy; gurobipy.Model()"` must print
    "Academic license ...", not "Restricted license".
 4. Snapshot data: download the daily files from the `daily-data` release, e.g.
-   `gh release download daily-data -R leopoldgemi/lime-paris-rebalancing -D ../lime-data/daily`.
+   `gh release download daily-data -R leopoldvscholz-star/lime-paris-rebalancing -D ../lime-data/daily`.
 
 ### Step 1: model inputs (`build_model_inputs.py`, ~10 s per day)
 
